@@ -31,6 +31,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.HTTPAddr != ":8080" || cfg.LogLevel != slog.LevelInfo || cfg.ShutdownTimeout != 10*time.Second {
 		t.Errorf("unexpected defaults: %+v", cfg)
 	}
+	if !cfg.MigrateOnStart {
+		t.Error("MIGRATE_ON_START should default to true")
+	}
 	if len(cfg.KafkaBrokers) != 2 || cfg.KafkaBrokers[1] != "kafka2:9092" {
 		t.Errorf("brokers not split and trimmed: %v", cfg.KafkaBrokers)
 	}
@@ -41,11 +44,12 @@ func TestLoadOverrides(t *testing.T) {
 	m["HTTP_ADDR"] = "127.0.0.1:9000"
 	m["LOG_LEVEL"] = "debug"
 	m["SHUTDOWN_TIMEOUT"] = "3s"
+	m["MIGRATE_ON_START"] = "false"
 	cfg, err := Load(env(m))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.HTTPAddr != "127.0.0.1:9000" || cfg.LogLevel != slog.LevelDebug || cfg.ShutdownTimeout != 3*time.Second {
+	if cfg.HTTPAddr != "127.0.0.1:9000" || cfg.LogLevel != slog.LevelDebug || cfg.ShutdownTimeout != 3*time.Second || cfg.MigrateOnStart {
 		t.Errorf("overrides not applied: %+v", cfg)
 	}
 }
@@ -55,13 +59,14 @@ func TestLoadReportsAllProblems(t *testing.T) {
 		"HTTP_ADDR":        "nonsense",
 		"LOG_LEVEL":        "loud",
 		"SHUTDOWN_TIMEOUT": "-1s",
+		"MIGRATE_ON_START": "maybe",
 		"POSTGRES_DSN":     "mysql://x",
 		"REDIS_ADDR":       "redis",
 	}))
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	for _, key := range []string{"HTTP_ADDR", "LOG_LEVEL", "SHUTDOWN_TIMEOUT", "POSTGRES_DSN", "REDIS_ADDR", "KAFKA_BROKERS", "API_TOKEN"} {
+	for _, key := range []string{"HTTP_ADDR", "LOG_LEVEL", "SHUTDOWN_TIMEOUT", "MIGRATE_ON_START", "POSTGRES_DSN", "REDIS_ADDR", "KAFKA_BROKERS", "API_TOKEN"} {
 		if !strings.Contains(err.Error(), key) {
 			t.Errorf("error does not mention %s: %v", key, err)
 		}

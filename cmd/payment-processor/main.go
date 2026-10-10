@@ -11,6 +11,7 @@ import (
 
 	"github.com/pos-term/payment-processor/internal/config"
 	"github.com/pos-term/payment-processor/internal/httpserver"
+	"github.com/pos-term/payment-processor/internal/storage"
 )
 
 func main() {
@@ -33,5 +34,11 @@ func run() error {
 	defer stop()
 
 	log.Info("starting payment-processor")
+	if cfg.MigrateOnStart {
+		if err := storage.Migrate(cfg.PostgresDSN, log); err != nil {
+			return err
+		}
+	}
+
 	return httpserver.Run(ctx, httpserver.New(cfg.HTTPAddr, log), cfg.ShutdownTimeout, log)
 }

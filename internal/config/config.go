@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,6 +21,7 @@ type Config struct {
 	PostgresDSN     string
 	RedisAddr       string
 	APIToken        string
+	MigrateOnStart  bool
 }
 
 // Load reads the configuration through lookup (os.LookupEnv in production).
@@ -35,6 +37,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		RedisAddr:       l.required("REDIS_ADDR"),
 		APIToken:        l.required("API_TOKEN"),
 	}
+	cfg.MigrateOnStart = l.boolean("MIGRATE_ON_START", true)
 	cfg.LogLevel = l.logLevel("LOG_LEVEL", slog.LevelInfo)
 	cfg.KafkaBrokers = l.list("KAFKA_BROKERS")
 
@@ -82,6 +85,19 @@ func (l *loader) required(key string) string {
 		return ""
 	}
 	return v
+}
+
+func (l *loader) boolean(key string, def bool) bool {
+	v := l.str(key, "")
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		l.fail(key, "must be true or false, got %q", v)
+		return def
+	}
+	return b
 }
 
 func (l *loader) duration(key string, def time.Duration) time.Duration {
