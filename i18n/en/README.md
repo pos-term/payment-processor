@@ -48,6 +48,22 @@ erDiagram
 - The `pending` status is not stored: no row in `transaction_results` means the payment is still being processed.
 - A terminal's history is served by the `(terminal_id, transaction_id DESC)` index: UUIDv7 is ordered by creation time.
 
+## Kafka consumer
+
+The service reads `pos.transactions.v1` in the `payment-processor` consumer group with manual offset commits (`enable.auto.commit=false`). An offset is committed only for records the handler finished without an error, so no event is lost on restart. A transient handler error is retried with a growing pause; the record is neither skipped nor committed. A new group reads the topic from the beginning.
+
+For now the handler is a stub that only writes the record to the debug log. Payment processing is added by the next steps of epic PP#1.
+
+## Tests
+
+```bash
+go test ./...   # tests that need Kafka or Postgres are skipped without the variables below
+docker compose -f ../infra/docker-compose.yml up -d kafka kafka-init postgres
+TEST_KAFKA_BROKERS=localhost:9094 TEST_POSTGRES_DSN='postgres://pos:pos@localhost:5432/pos?sslmode=disable' go test -race ./...
+```
+
+The consumer tests create their own topic and group.
+
 ## Contracts
 
 - [REST API](https://github.com/pos-term/infra/blob/main/api/i18n/en/README.md): OpenAPI specification [openapi.yaml](https://github.com/pos-term/infra/blob/main/api/openapi.yaml)

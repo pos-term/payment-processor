@@ -48,6 +48,22 @@ erDiagram
 - Статус `pending` не хранится: нет строки в `transaction_results`, значит платёж ещё в обработке.
 - История терминала отдаётся по индексу `(terminal_id, transaction_id DESC)`: UUIDv7 упорядочен по времени создания.
 
+## Kafka consumer
+
+Сервис читает `pos.transactions.v1` в consumer-группе `payment-processor` с ручным коммитом оффсетов (`enable.auto.commit=false`). Оффсет коммитится только для записей, которые обработчик завершил без ошибки, поэтому при перезапуске ни одно событие не теряется. Временная ошибка обработчика повторяется с растущей паузой, запись не пропускается и не коммитится. Новая группа читает топик с начала.
+
+Пока обработчик-заглушка только пишет запись в debug-лог. Обработка платежей добавляется следующими шагами эпика PP#1.
+
+## Тесты
+
+```bash
+go test ./...   # тесты, которым нужны Kafka или Postgres, пропускаются без переменных ниже
+docker compose -f ../infra/docker-compose.yml up -d kafka kafka-init postgres
+TEST_KAFKA_BROKERS=localhost:9094 TEST_POSTGRES_DSN='postgres://pos:pos@localhost:5432/pos?sslmode=disable' go test -race ./...
+```
+
+Тесты consumer создают свой топик и группу.
+
 ## Контракты
 
 - [REST API](https://github.com/pos-term/infra/blob/main/api/README.md): OpenAPI-спецификация [openapi.yaml](https://github.com/pos-term/infra/blob/main/api/openapi.yaml)

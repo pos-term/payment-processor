@@ -9,7 +9,10 @@ import (
 	"os/signal"
 	"syscall"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/pos-term/payment-processor/internal/config"
+	"github.com/pos-term/payment-processor/internal/consumer"
 	"github.com/pos-term/payment-processor/internal/httpserver"
 	"github.com/pos-term/payment-processor/internal/storage"
 )
@@ -40,5 +43,23 @@ func run() error {
 		}
 	}
 
-	return httpserver.Run(ctx, httpserver.New(cfg.HTTPAddr, log), cfg.ShutdownTimeout, log)
+	cons, err := consumer.New(consumer.Config{Brokers: cfg.KafkaBrokers}, log)
+	if err != nil {
+		return err
+	}
+	defer cons.Close()
+
+	// Placeholder until the processing steps land: records are only logged, then their offsets are committed.
+	logOnly := consumer.HandlerFunc(func(_ context.Context, rec consumer.Record) error {
+		log.Debug("record consumed", "partition", rec.Partition, "offset", rec.Offset, "key", string(rec.Key))
+		return nil
+	})
+
+	// Either part failing stops the other one.
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return cons.Run(gctx, logOnly) })
+	g.Go(func() error {
+		return httpserver.Run(gctx, httpserver.New(cfg.HTTPAddr, log), cfg.ShutdownTimeout, log)
+	})
+	return g.Wait()
 }
