@@ -31,10 +31,18 @@ type Store interface {
 	GetResult(ctx context.Context, id string) (storage.Result, bool, error)
 }
 
+// Deduper is the fast duplicate filter in front of Postgres. It only ever saves work:
+// a wrong or missing answer must neither lose nor double-process a payment.
+type Deduper interface {
+	// FirstSeen reports whether this is the first time the id is seen within the filter's TTL.
+	FirstSeen(ctx context.Context, transactionID string) (bool, error)
+}
+
 // Processor handles one record at a time. Handle returns nil only when the record needs no
 // further work, so the consumer may commit its offset. Any other error is transient: retry, do not commit.
 type Processor struct {
 	store          Store
+	dedup          Deduper
 	dlq            DeadLetterPublisher
 	maxAmountMinor int64
 	now            func() time.Time
@@ -42,8 +50,8 @@ type Processor struct {
 }
 
 // New builds a Processor. Payments above maxAmountMinor fail with LIMIT_EXCEEDED, 0 disables the limit.
-func New(store Store, dlq DeadLetterPublisher, maxAmountMinor int64, log *slog.Logger) *Processor {
-	return &Processor{store: store, dlq: dlq, maxAmountMinor: maxAmountMinor, now: time.Now, log: log}
+func New(store Store, dedup Deduper, dlq DeadLetterPublisher, maxAmountMinor int64, log *slog.Logger) *Processor {
+	return &Processor{store: store, dedup: dedup, dlq: dlq, maxAmountMinor: maxAmountMinor, now: time.Now, log: log}
 }
 
 // Handle processes a pos.transactions.v1 record.
@@ -63,6 +71,24 @@ func (p *Processor) Handle(ctx context.Context, rec consumer.Record) error {
 	}
 	log := p.log.With("transaction_id", tx.TransactionID, "terminal_id", tx.TerminalID, "trace_id", rec.Headers["trace_id"])
 
+	// Level 1, Redis
+	first, err := p.dedup.FirstSeen(ctx, tx.TransactionID)
+	if err != nil {
+		log.Warn("dedup filter unavailable, falling back to postgres", "error", err)
+		first = true
+	}
+	if !first {
+		// Seen before, but only a stored result proves the earlier attempt finished.
+		// Without one the attempt died half way, so this record must finish the job.
+		if _, ok, err := p.store.GetResult(ctx, tx.TransactionID); err != nil {
+			return err
+		} else if ok {
+			log.Info("duplicate, already processed")
+			return nil
+		}
+	}
+
+	// Level 2, Postgres: the primary key is the source of truth.
 	// pending: the transaction is stored, no result yet. A crash from here on leaves it pending;
 	// the replay of this record completes it.
 	if _, err := p.store.InsertTransaction(ctx, storage.Transaction{

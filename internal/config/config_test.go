@@ -92,3 +92,19 @@ func TestMaxAmountMinor(t *testing.T) {
 		}
 	}
 }
+
+func TestDedupTTL(t *testing.T) {
+	cfg, err := Load(env(valid()))
+	if err != nil || cfg.DedupTTL != 24*time.Hour {
+		t.Fatalf("default: %v, %v; want 24h", cfg.DedupTTL, err)
+	}
+	m := valid()
+	m["DEDUP_TTL"] = "90m"
+	if cfg, err = Load(env(m)); err != nil || cfg.DedupTTL != 90*time.Minute {
+		t.Errorf("override: %v, %v; want 90m", cfg.DedupTTL, err)
+	}
+	m["DEDUP_TTL"] = "-5s"
+	if _, err := Load(env(m)); err == nil || !strings.Contains(err.Error(), "DEDUP_TTL") {
+		t.Errorf("negative TTL: err = %v, want a DEDUP_TTL error", err)
+	}
+}

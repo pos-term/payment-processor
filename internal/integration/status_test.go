@@ -91,7 +91,7 @@ func TestTransactionsAreStoredWithStatus(t *testing.T) {
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
-	go func() { defer close(done); _ = cons.Run(runCtx, processor.New(store, cons, 10000, log)) }()
+	go func() { defer close(done); _ = cons.Run(runCtx, processor.New(store, noDedup{}, cons, 10000, log)) }()
 	defer func() { cancel(); <-done; cons.Close() }()
 
 	deadline := time.Now().Add(60 * time.Second)

@@ -20,6 +20,7 @@ type memStore struct {
 	txs     map[string]storage.Transaction
 	results map[string]storage.Result
 	failOn  string // method name that fails once: "insert" or "save"
+	saves   int
 }
 
 func newMemStore() *memStore {
@@ -53,6 +54,7 @@ func (s *memStore) SaveResult(_ context.Context, id, status string, reason *stri
 	if s.fail("save") {
 		return errBoom
 	}
+	s.saves++
 	if _, ok := s.results[id]; !ok {
 		s.results[id] = storage.Result{TransactionID: id, TerminalID: s.txs[id].TerminalID, Status: status, Reason: reason, ProcessedAt: at}
 	}
@@ -79,8 +81,33 @@ func (m *memDLQ) PublishDeadLetter(_ context.Context, d consumer.DeadLetter) err
 	return nil
 }
 
+type memDedup struct {
+	mu   sync.Mutex
+	seen map[string]bool
+	err  error
+}
+
+func newDedup() *memDedup { return &memDedup{seen: map[string]bool{}} }
+
+func (d *memDedup) FirstSeen(_ context.Context, id string) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.err != nil {
+		return false, d.err
+	}
+	first := !d.seen[id]
+	d.seen[id] = true
+	return first, nil
+}
+
+func (d *memDedup) flush() { d.mu.Lock(); d.seen = map[string]bool{}; d.mu.Unlock() }
+
 func newProc(store *memStore, dlq *memDLQ, maxAmount int64) *Processor {
-	return New(store, dlq, maxAmount, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return newProcWith(store, newDedup(), dlq, maxAmount)
+}
+
+func newProcWith(store *memStore, dedup *memDedup, dlq *memDLQ, maxAmount int64) *Processor {
+	return New(store, dedup, dlq, maxAmount, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func rec(value string) consumer.Record {
@@ -220,5 +247,74 @@ func TestSameRecordTwiceKeepsTheFirstResult(t *testing.T) {
 	}
 	if len(store.txs) != 1 || len(store.results) != 1 {
 		t.Errorf("%d txs, %d results, want 1 each", len(store.txs), len(store.results))
+	}
+}
+
+func handleTwice(t *testing.T, p *Processor, between func()) {
+	t.Helper()
+	if err := p.Handle(context.Background(), rec(validTx)); err != nil {
+		t.Fatal(err)
+	}
+	if between != nil {
+		between()
+	}
+	if err := p.Handle(context.Background(), rec(validTx)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDuplicateIsProcessedOnce(t *testing.T) {
+	store := newMemStore()
+	handleTwice(t, newProc(store, &memDLQ{}, 0), nil)
+
+	if len(store.txs) != 1 || len(store.results) != 1 || store.saves != 1 {
+		t.Errorf("%d txs, %d results, %d decisions; want 1 each", len(store.txs), len(store.results), store.saves)
+	}
+}
+
+// Flushing Redis must not lead to double processing: Postgres still knows the transaction.
+func TestRedisFlushDoesNotCauseDoubleProcessing(t *testing.T) {
+	store, dedup := newMemStore(), newDedup()
+	handleTwice(t, newProcWith(store, dedup, &memDLQ{}, 0), dedup.flush)
+
+	if len(store.txs) != 1 || len(store.results) != 1 || store.saves != 1 {
+		t.Errorf("%d txs, %d results, %d decisions; want 1 each", len(store.txs), len(store.results), store.saves)
+	}
+}
+
+func TestRedisDownFallsBackToPostgres(t *testing.T) {
+	store, dedup := newMemStore(), newDedup()
+	dedup.err = errBoom
+	handleTwice(t, newProcWith(store, dedup, &memDLQ{}, 0), nil)
+
+	if len(store.txs) != 1 || store.saves != 1 {
+		t.Errorf("%d txs, %d decisions; want 1 each", len(store.txs), store.saves)
+	}
+}
+
+// Redis was marked, then the service died before Postgres saw the payment. Redis must not swallow it.
+func TestRedisMarkWithoutPostgresRowStillProcesses(t *testing.T) {
+	store, dedup := newMemStore(), newDedup()
+	dedup.seen[txID] = true
+	if err := newProcWith(store, dedup, &memDLQ{}, 0).Handle(context.Background(), rec(validTx)); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.txs) != 1 || store.saves != 1 {
+		t.Errorf("%d txs, %d decisions; want the payment processed once", len(store.txs), store.saves)
+	}
+}
+
+func TestDifferentTransactionsAreNotDeduplicated(t *testing.T) {
+	store := newMemStore()
+	p := newProc(store, &memDLQ{}, 0)
+	other := `{"schema_version":1,"transaction_id":"0192f0c4-7a3e-7b21-9d4e-2c1f8a6b5e11","terminal_id":"term-001",` +
+		`"amount_minor":100,"currency":"RUB","created_at":"2026-09-19T10:15:30.123Z","seq":43}`
+	for _, v := range []string{validTx, other} {
+		if err := p.Handle(context.Background(), rec(v)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(store.txs) != 2 || store.saves != 2 {
+		t.Errorf("%d txs, %d decisions; want 2 each", len(store.txs), store.saves)
 	}
 }

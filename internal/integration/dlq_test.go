@@ -78,7 +78,7 @@ func TestBadMessagesReachDLQAndPartitionKeepsMoving(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proc := processor.New(&noStore{}, cons, 0, log)
+	proc := processor.New(&noStore{}, noDedup{}, cons, 0, log)
 	var mu sync.Mutex
 	handled := 0
 	runCtx, cancel := context.WithCancel(ctx)
@@ -159,3 +159,8 @@ func (noStore) SaveResult(context.Context, string, string, *string, time.Time) e
 func (noStore) GetResult(context.Context, string) (storage.Result, bool, error) {
 	return storage.Result{}, false, nil
 }
+
+// noDedup says every id is new: Postgres alone decides.
+type noDedup struct{}
+
+func (noDedup) FirstSeen(context.Context, string) (bool, error) { return true, nil }

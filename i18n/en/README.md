@@ -18,6 +18,7 @@ The service is configured through environment variables.
 | `LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error` |
 | `SHUTDOWN_TIMEOUT` | no | `10s` | Time allowed for a graceful shutdown |
 | `MIGRATE_ON_START` | no | `true` | Apply Postgres migrations on startup |
+| `DEDUP_TTL` | no | `24h` | Lifetime of the deduplication key in Redis |
 | `MAX_AMOUNT_MINOR` | no | `10000000` | Payment limit in minor units (kopecks for RUB): above it the payment is `failed` with `LIMIT_EXCEEDED`. `0` disables the limit |
 
 ## Database
@@ -76,12 +77,27 @@ A valid transaction is stored in Postgres as `pending` (a row in `transactions` 
 
 A declined payment is an ordinary business result and does not go to the DLQ. There is only one rule for now; the list of `reason` codes will grow together with INFRA#1. The outcome is written once: a second write does not change a stored result. If the service dies between storing the transaction and the result, the transaction stays `pending` and a replay of the same Kafka record completes it. Publishing the result is added by the next steps of epic PP#1.
 
+## Deduplication
+
+A terminal may retry a send, and a payment must not be processed twice. Two levels, both by `transaction_id`:
+
+1. **Redis** (fast filter): `SET dedup:tx:<id> NX` with the TTL `DEDUP_TTL`. An existing key means the id was seen.
+2. **Postgres** (source of truth): the primary key `transactions.transaction_id` and the single result in `transaction_results`.
+
+Redis is a hint, not a guarantee, so nothing depends on it:
+
+- A retry that Redis recognises is still checked against Postgres. Only a transaction with a stored result is skipped. Without a result (the service died after the Redis write but before the Postgres write, or in between), the retry finishes the payment.
+- Redis flushed or the key expired: the id looks new again, but Postgres already knows the transaction and its result, so the payment is not decided a second time.
+- Redis unavailable: a warning in the log and Postgres alone does the job.
+
+The service also starts when Redis is down.
+
 ## Tests
 
 ```bash
 go test ./...   # tests that need Kafka or Postgres are skipped without the variables below
-docker compose -f ../infra/docker-compose.yml up -d kafka kafka-init postgres
-TEST_KAFKA_BROKERS=localhost:9094 TEST_POSTGRES_DSN='postgres://pos:pos@localhost:5432/pos?sslmode=disable' go test -race ./...
+docker compose -f ../infra/docker-compose.yml up -d kafka kafka-init postgres redis
+TEST_KAFKA_BROKERS=localhost:9094 TEST_POSTGRES_DSN='postgres://pos:pos@localhost:5432/pos?sslmode=disable' TEST_REDIS_ADDR=localhost:6379 go test -race ./...
 ```
 
 The consumer tests create their own topic and group.

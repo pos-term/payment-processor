@@ -18,6 +18,7 @@ Backend-сервис на Go: consumer Kafka с идемпотентной об�
 | `LOG_LEVEL` | нет | `info` | `debug`, `info`, `warn`, `error` |
 | `SHUTDOWN_TIMEOUT` | нет | `10s` | Время на корректную остановку |
 | `MIGRATE_ON_START` | нет | `true` | Применять миграции Postgres при старте |
+| `DEDUP_TTL` | нет | `24h` | Время жизни ключа дедупликации в Redis |
 | `MAX_AMOUNT_MINOR` | нет | `10000000` | Лимит платежа в минорных единицах (копейки для RUB): больше значит `failed` с `LIMIT_EXCEEDED`. `0` отключает лимит |
 
 ## База данных
@@ -76,12 +77,27 @@ erDiagram
 
 Отказ платежа это обычный бизнес-результат, в DLQ он не уходит. Правило пока одно, список кодов `reason` будет расширен вместе с INFRA#1. Итог пишется один раз: повторная запись не меняет уже сохранённый результат. Если сервис упал между сохранением транзакции и результатом, транзакция остаётся `pending`, повтор той же записи из Kafka доводит её до итога. Публикация результата добавляется следующими шагами эпика PP#1.
 
+## Дедупликация
+
+Терминал может повторить отправку, и платёж не должен обработаться дважды. Два уровня, оба по `transaction_id`:
+
+1. **Redis** (быстрый фильтр): `SET dedup:tx:<id> NX` с TTL `DEDUP_TTL`. Ключ уже есть значит id уже видели.
+2. **Postgres** (источник правды): первичный ключ `transactions.transaction_id` и единственный результат в `transaction_results`.
+
+Redis это подсказка, а не гарантия, поэтому на нём ничего не держится:
+
+- Повтор, который Redis узнал, всё равно проверяется по Postgres. Пропускается только транзакция с сохранённым результатом. Если результата нет (сервис упал после записи в Redis, но до записи в Postgres, или посередине), повтор доводит платёж до конца.
+- Redis сброшен или ключ истёк: id снова «новый», но Postgres уже знает транзакцию и результат, второй раз платёж не решается.
+- Redis недоступен: предупреждение в логе и работа только на Postgres.
+
+Сервис стартует и при недоступном Redis.
+
 ## Тесты
 
 ```bash
 go test ./...   # тесты, которым нужны Kafka или Postgres, пропускаются без переменных ниже
-docker compose -f ../infra/docker-compose.yml up -d kafka kafka-init postgres
-TEST_KAFKA_BROKERS=localhost:9094 TEST_POSTGRES_DSN='postgres://pos:pos@localhost:5432/pos?sslmode=disable' go test -race ./...
+docker compose -f ../infra/docker-compose.yml up -d kafka kafka-init postgres redis
+TEST_KAFKA_BROKERS=localhost:9094 TEST_POSTGRES_DSN='postgres://pos:pos@localhost:5432/pos?sslmode=disable' TEST_REDIS_ADDR=localhost:6379 go test -race ./...
 ```
 
 Тесты consumer создают свой топик и группу.

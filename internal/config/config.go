@@ -22,6 +22,7 @@ type Config struct {
 	RedisAddr       string
 	APIToken        string
 	MigrateOnStart  bool
+	DedupTTL        time.Duration
 	// MaxAmountMinor is the payment limit in minor units, 0 disables it.
 	MaxAmountMinor int64
 }
@@ -39,6 +40,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		RedisAddr:       l.required("REDIS_ADDR"),
 		APIToken:        l.required("API_TOKEN"),
 	}
+	cfg.DedupTTL = l.duration("DEDUP_TTL", 24*time.Hour)
 	cfg.MaxAmountMinor = l.nonNegativeInt("MAX_AMOUNT_MINOR", 10_000_000)
 	cfg.MigrateOnStart = l.boolean("MIGRATE_ON_START", true)
 	cfg.LogLevel = l.logLevel("LOG_LEVEL", slog.LevelInfo)

@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/pos-term/payment-processor/internal/config"
@@ -50,13 +51,20 @@ func run() error {
 	}
 	defer store.Close()
 
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+	defer rdb.Close()
+	// Redis is only a filter, so it may be down at start: the processor falls back to Postgres.
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Warn("redis is not reachable, deduplication relies on postgres only", "error", err)
+	}
+
 	cons, err := consumer.New(consumer.Config{Brokers: cfg.KafkaBrokers}, log)
 	if err != nil {
 		return err
 	}
 	defer cons.Close()
 
-	proc := processor.New(store, cons, cfg.MaxAmountMinor, log)
+	proc := processor.New(store, processor.NewRedisDeduper(rdb, cfg.DedupTTL), cons, cfg.MaxAmountMinor, log)
 
 	// Either part failing stops the other one.
 	g, gctx := errgroup.WithContext(ctx)
