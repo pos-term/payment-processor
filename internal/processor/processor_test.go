@@ -19,7 +19,7 @@ type memStore struct {
 	mu      sync.Mutex
 	txs     map[string]storage.Transaction
 	results map[string]storage.Result
-	failOn  string // method name that fails once: "insert" or "save"
+	failOn  string // method name that fails once: "insert", "save" or "mark"
 	saves   int
 }
 
@@ -58,6 +58,18 @@ func (s *memStore) SaveResult(_ context.Context, id, status string, reason *stri
 	if _, ok := s.results[id]; !ok {
 		s.results[id] = storage.Result{TransactionID: id, TerminalID: s.txs[id].TerminalID, Status: status, Reason: reason, ProcessedAt: at}
 	}
+	return nil
+}
+
+func (s *memStore) MarkPublished(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fail("mark") {
+		return errBoom
+	}
+	r := s.results[id]
+	r.Published = true
+	s.results[id] = r
 	return nil
 }
 
@@ -393,16 +405,63 @@ func TestPublishFailureIsRetriedWithoutDecidingAgain(t *testing.T) {
 	}
 }
 
-// Until step 6 records the delivery, a duplicate republishes the stored result: a result may be
-// delivered more than once, never lost, and never recomputed.
-func TestDuplicateRepublishesTheStoredResult(t *testing.T) {
+// The same transaction twice publishes one result: the second delivery finds it recorded as published.
+func TestDuplicatePublishesNothing(t *testing.T) {
 	store, pub := newMemStore(), &memDLQ{}
 	handleTwice(t, newProc(store, pub, 0), nil)
+
+	if len(pub.results) != 1 || store.saves != 1 {
+		t.Errorf("%d published, %d decisions; want 1 each", len(pub.results), store.saves)
+	}
+	if !store.results[txID].Published {
+		t.Error("the result must be recorded as published")
+	}
+}
+
+func TestFlushedRedisDuplicatePublishesNothing(t *testing.T) {
+	store, dedup, pub := newMemStore(), newDedup(), &memDLQ{}
+	handleTwice(t, newProcWith(store, dedup, pub, 0), dedup.flush)
+
+	if len(pub.results) != 1 || store.saves != 1 {
+		t.Errorf("%d published, %d decisions; want 1 each", len(pub.results), store.saves)
+	}
+}
+
+// The service dies after the broker acknowledged the result but before Postgres knows: the replay
+// publishes it again (at-least-once, nothing lost), with the same data, and decides nothing.
+func TestCrashBetweenPublishAndMarkRepublishesTheSameResult(t *testing.T) {
+	store, pub := newMemStore(), &memDLQ{}
+	p := newProc(store, pub, 0)
+
+	store.failOn = "mark"
+	if err := p.Handle(context.Background(), rec(validTx)); !errors.Is(err, errBoom) {
+		t.Fatalf("err = %v, want the store error so the offset stays uncommitted", err)
+	}
+	if err := p.Handle(context.Background(), rec(validTx)); err != nil {
+		t.Fatal(err)
+	}
+	// A third delivery of the record finds it marked and stays quiet.
+	if err := p.Handle(context.Background(), rec(validTx)); err != nil {
+		t.Fatal(err)
+	}
 
 	if len(pub.results) != 2 || pub.results[0] != pub.results[1] {
 		t.Errorf("results = %+v; want the same result twice", pub.results)
 	}
-	if store.saves != 1 {
-		t.Errorf("decisions = %d, want 1", store.saves)
+	if store.saves != 1 || len(store.results) != 1 {
+		t.Errorf("%d decisions, %d stored results; want 1 each", store.saves, len(store.results))
+	}
+}
+
+// The offset is committed only after the result is published: Handle must not return nil before that.
+func TestHandleReturnsNilOnlyAfterPublishAndMark(t *testing.T) {
+	store, pub := newMemStore(), &memDLQ{failRes: 1}
+	p := newProc(store, pub, 0)
+
+	if err := p.Handle(context.Background(), rec(validTx)); err == nil {
+		t.Fatal("Handle returned nil although the result was not published: the offset would be committed")
+	}
+	if store.results[txID].Published {
+		t.Error("a result that was not published must not be recorded as published")
 	}
 }

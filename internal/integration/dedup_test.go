@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -44,6 +45,14 @@ type dedupEnv struct {
 
 // setupDedup wires Kafka, Postgres and Redis (at redisAddr) around a running processor.
 func setupDedup(t *testing.T, redisAddr string) *dedupEnv {
+	t.Helper()
+	e := setupInfra(t, redisAddr)
+	e.start(t, e.store)
+	return e
+}
+
+// setupInfra creates the database, topics and clients; no processor runs yet.
+func setupInfra(t *testing.T, redisAddr string) *dedupEnv {
 	t.Helper()
 	brokers, adminDSN := os.Getenv("TEST_KAFKA_BROKERS"), os.Getenv("TEST_POSTGRES_DSN")
 	if brokers == "" || adminDSN == "" || os.Getenv("TEST_REDIS_ADDR") == "" {
@@ -100,16 +109,63 @@ func setupDedup(t *testing.T, redisAddr string) *dedupEnv {
 	}
 	t.Cleanup(func() { _, _ = adm.DeleteTopics(ctx, e.cfg.InputTopic, e.cfg.DLQTopic, e.cfg.ResultsTopic) })
 
+	return e
+}
+
+// instance is one running processor, a member of the consumer group.
+type instance struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	cons   *consumer.Consumer
+}
+
+// stop ends the instance and leaves the group; records it did not finish stay uncommitted.
+func (i *instance) stop() { i.cancel(); <-i.done; i.cons.Close() }
+
+// start runs a processor on top of st and stops it when the test ends.
+func (e *dedupEnv) start(t *testing.T, st processor.Store) *instance {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cons, err := consumer.New(e.cfg, log)
 	if err != nil {
 		t.Fatal(err)
 	}
-	proc := processor.New(e.store, processor.NewRedisDeduper(e.redis, time.Hour), cons, 0, log)
-	runCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() { defer close(done); _ = cons.Run(runCtx, proc) }()
-	t.Cleanup(func() { cancel(); <-done; cons.Close() })
-	return e
+	proc := processor.New(st, processor.NewRedisDeduper(e.redis, time.Hour), cons, 0, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	i := &instance{cancel: cancel, done: make(chan struct{}), cons: cons}
+	go func() { defer close(i.done); _ = cons.Run(ctx, proc) }()
+	t.Cleanup(i.stop)
+	return i
+}
+
+// resultCounts reads the results topic and counts messages per transaction_id. It waits for atLeast
+// messages, then one more second so that an unwanted extra message has time to show up.
+func (e *dedupEnv) resultCounts(t *testing.T, atLeast int) map[string]int {
+	t.Helper()
+	reader, err := kgo.NewClient(kgo.SeedBrokers(e.cfg.Brokers...),
+		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{e.cfg.ResultsTopic: {0: kgo.NewOffset().AtStart()}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	counts, total := map[string]int{}, 0
+	poll := func() {
+		c, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		reader.PollFetches(c).EachRecord(func(r *kgo.Record) {
+			var m struct {
+				TransactionID string `json:"transaction_id"`
+			}
+			_ = json.Unmarshal(r.Value, &m)
+			counts[m.TransactionID]++
+			total++
+		})
+	}
+	for end := time.Now().Add(60 * time.Second); total < atLeast && time.Now().Before(end); {
+		poll()
+	}
+	poll()
+	return counts
 }
 
 func (e *dedupEnv) send(t *testing.T, id string) {
@@ -162,6 +218,9 @@ func TestDuplicateIsProcessedOnce(t *testing.T) {
 	e.waitResult(t, idB)
 
 	e.assertOnce(t, idA, idB)
+	if got := e.resultCounts(t, 2); got[idA] != 1 || got[idB] != 1 || len(got) != 2 {
+		t.Errorf("published results = %v, want one for each of the two payments", got)
+	}
 	// Redis really remembered the id: that is what filtered the retry.
 	if n, err := e.redis.Exists(context.Background(), "dedup:tx:"+idA).Result(); err != nil || n != 1 {
 		t.Errorf("redis key for %s: exists=%d err=%v, want 1", idA, n, err)
@@ -183,6 +242,9 @@ func TestRedisFlushDoesNotCauseDoubleProcessing(t *testing.T) {
 	e.waitResult(t, idC)
 
 	e.assertOnce(t, idA, idC)
+	if got := e.resultCounts(t, 2); got[idA] != 1 || got[idC] != 1 || len(got) != 2 {
+		t.Errorf("published results = %v, want one for each of the two payments", got)
+	}
 }
 
 // Redis is only a filter: with it unreachable the same guarantees hold, backed by Postgres alone.
@@ -194,4 +256,70 @@ func TestRedisDownFallsBackToPostgres(t *testing.T) {
 	e.waitResult(t, idB)
 
 	e.assertOnce(t, idA, idB)
+	if got := e.resultCounts(t, 2); got[idA] != 1 || got[idB] != 1 || len(got) != 2 {
+		t.Errorf("published results = %v, want one for each of the two payments", got)
+	}
+}
+
+// hookedStore breaks MarkPublished once for one transaction, like a crash after the publish.
+type hookedStore struct {
+	*countingStore
+	crashOn string
+	crashed atomic.Bool
+	onCrash func()
+}
+
+func (s *hookedStore) MarkPublished(ctx context.Context, id string) error {
+	if id == s.crashOn && s.crashed.CompareAndSwap(false, true) {
+		s.onCrash()
+		return fmt.Errorf("simulated crash after the publish")
+	}
+	return s.countingStore.MarkPublished(ctx, id)
+}
+
+// The service dies after the result reached Kafka but before it was recorded and the offset committed.
+// Nothing is lost: the restarted instance publishes that one result again, decides nothing a second
+// time, and every other result stays single.
+func TestCrashAfterPublishLosesNoResult(t *testing.T) {
+	e := setupInfra(t, os.Getenv("TEST_REDIS_ADDR"))
+
+	var first *instance
+	hooked := &hookedStore{countingStore: e.store, crashOn: idB}
+	hooked.onCrash = func() { go first.cancel() }
+	first = e.start(t, hooked)
+
+	e.send(t, idA)
+	e.send(t, idB) // the crash happens while this one is being delivered
+	e.send(t, idC)
+
+	deadline := time.Now().Add(30 * time.Second)
+	for !hooked.crashed.Load() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !hooked.crashed.Load() {
+		t.Fatal("the crash point was never reached")
+	}
+	first.stop()
+
+	// The replacement joins the same group and continues from the last committed offset.
+	e.start(t, e.store)
+	e.waitResult(t, idC)
+	deadline = time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if r, ok, _ := e.store.GetResult(context.Background(), idC); ok && r.Published {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	e.assertOnce(t, idA, idB, idC)
+	got := e.resultCounts(t, 4)
+	if got[idA] != 1 || got[idB] != 2 || got[idC] != 1 || len(got) != 3 {
+		t.Errorf("published results = %v, want A once, B twice (the replay), C once", got)
+	}
+	for _, id := range []string{idA, idB, idC} {
+		if r, ok, _ := e.store.GetResult(context.Background(), id); !ok || !r.Published {
+			t.Errorf("%s: result must be recorded as published after the replay: %+v", id, r)
+		}
+	}
 }

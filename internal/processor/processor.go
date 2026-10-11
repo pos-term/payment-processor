@@ -31,6 +31,7 @@ type Store interface {
 	InsertTransaction(ctx context.Context, tx storage.Transaction) (bool, error)
 	SaveResult(ctx context.Context, id, status string, reason *string, processedAt time.Time) error
 	GetResult(ctx context.Context, id string) (storage.Result, bool, error)
+	MarkPublished(ctx context.Context, id string) error
 }
 
 // Deduper is the fast duplicate filter in front of Postgres. It only ever saves work:
@@ -82,14 +83,13 @@ func (p *Processor) Handle(ctx context.Context, rec consumer.Record) error {
 	}
 	trace := rec.Headers["trace_id"]
 	if !first {
-		// Seen before. A stored result means the payment is decided: do not decide it again, but hand
-		// the stored result to the terminal once more, because the earlier attempt may have died
-		// before publishing it. Without a stored result that attempt died half way: finish the job.
+		// Seen before. A stored result means the payment is decided: never decide it again, only make
+		// sure the terminal got it (deliver skips a result that is already recorded as published).
+		// Without a stored result the earlier attempt died half way: finish the job below.
 		if res, ok, err := p.store.GetResult(ctx, tx.TransactionID); err != nil {
 			return err
 		} else if ok {
-			log.Info("duplicate, republishing the stored result")
-			return p.publish(ctx, res, trace)
+			return p.deliver(ctx, log, res, trace)
 		}
 	}
 
@@ -119,20 +119,34 @@ func (p *Processor) Handle(ctx context.Context, rec consumer.Record) error {
 			return fmt.Errorf("result of %s vanished after save", tx.TransactionID)
 		}
 	}
-	if err := p.publish(ctx, res, trace); err != nil {
+	return p.deliver(ctx, log, res, trace)
+}
+
+// deliver makes sure the terminal gets the stored result, and records that it did.
+//
+// The order is the whole safety story: publish (acknowledged by the broker), then mark in Postgres,
+// then the caller commits the offset. A crash or an error at any point leaves the offset uncommitted,
+// so the record comes back and the next attempt starts from the stored result:
+//   - before the publish: the result is published now;
+//   - between the publish and the mark: the result is published once more (at-least-once, the
+//     terminal ignores a transaction_id it has already handled);
+//   - after the mark: nothing is published, so a retried duplicate yields exactly one result.
+func (p *Processor) deliver(ctx context.Context, log *slog.Logger, res storage.Result, traceID string) error {
+	if res.Published {
+		log.Info("duplicate, result already published")
+		return nil
+	}
+	if err := p.pub.PublishResult(ctx, consumer.Result{
+		TransactionID: res.TransactionID, TerminalID: res.TerminalID, Status: res.Status,
+		Reason: res.Reason, ProcessedAt: res.ProcessedAt, TraceID: traceID,
+	}); err != nil {
+		return err
+	}
+	if err := p.store.MarkPublished(ctx, res.TransactionID); err != nil {
 		return err
 	}
 	log.Info("transaction processed", "status", res.Status)
 	return nil
-}
-
-// publish hands the stored result to the terminal. An error leaves the offset uncommitted:
-// the replay finds the result in Postgres and publishes it without deciding anything again.
-func (p *Processor) publish(ctx context.Context, res storage.Result, traceID string) error {
-	return p.pub.PublishResult(ctx, consumer.Result{
-		TransactionID: res.TransactionID, TerminalID: res.TerminalID, Status: res.Status,
-		Reason: res.Reason, ProcessedAt: res.ProcessedAt, TraceID: traceID,
-	})
 }
 
 // decide is the business rule of the prototype: one amount limit.

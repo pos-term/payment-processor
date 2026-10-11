@@ -91,3 +91,31 @@ func TestFailedKeepsReasonAndFirstResultWins(t *testing.T) {
 		t.Errorf("unexpected result: %+v", r)
 	}
 }
+
+func TestMarkPublished(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	if _, err := s.InsertTransaction(ctx, sampleTx(txID1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveResult(ctx, txID1, "success", nil, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	if r, _, _ := s.GetResult(ctx, txID1); r.Published {
+		t.Fatal("a fresh result must not be published")
+	}
+	if err := s.MarkPublished(ctx, txID1); err != nil {
+		t.Fatal(err)
+	}
+	if r, _, _ := s.GetResult(ctx, txID1); !r.Published {
+		t.Fatal("the result must be published after MarkPublished")
+	}
+	// Idempotent, and an unknown id is not an error: the replay of a record may mark twice.
+	if err := s.MarkPublished(ctx, txID1); err != nil {
+		t.Errorf("second MarkPublished: %v", err)
+	}
+	if err := s.MarkPublished(ctx, txID2); err != nil {
+		t.Errorf("MarkPublished of an unknown id: %v", err)
+	}
+}

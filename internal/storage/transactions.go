@@ -27,6 +27,7 @@ type Result struct {
 	Status        string
 	Reason        *string // nil on success
 	ProcessedAt   time.Time
+	Published     bool // delivered to the results topic and recorded by MarkPublished
 }
 
 // Store is the Postgres-backed source of truth for transactions and their results.
@@ -80,11 +81,12 @@ func (s *Store) SaveResult(ctx context.Context, id, status string, reason *strin
 // GetResult returns the stored result, or false while the transaction is still pending or unknown.
 func (s *Store) GetResult(ctx context.Context, id string) (Result, bool, error) {
 	var r Result
+	var publishedAt *time.Time
 	err := s.pool.QueryRow(ctx,
-		`SELECT r.transaction_id::text, t.terminal_id, r.status, r.reason, r.processed_at
+		`SELECT r.transaction_id::text, t.terminal_id, r.status, r.reason, r.processed_at, r.published_at
 		 FROM transaction_results r JOIN transactions t USING (transaction_id)
 		 WHERE r.transaction_id = $1`, id).
-		Scan(&r.TransactionID, &r.TerminalID, &r.Status, &r.Reason, &r.ProcessedAt)
+		Scan(&r.TransactionID, &r.TerminalID, &r.Status, &r.Reason, &r.ProcessedAt, &publishedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Result{}, false, nil
 	}
@@ -92,5 +94,16 @@ func (s *Store) GetResult(ctx context.Context, id string) (Result, bool, error) 
 		return Result{}, false, fmt.Errorf("get result: %w", err)
 	}
 	r.ProcessedAt = r.ProcessedAt.UTC()
+	r.Published = publishedAt != nil
 	return r, true, nil
+}
+
+// MarkPublished records that the result reached the results topic. Repeating it changes nothing.
+func (s *Store) MarkPublished(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE transaction_results SET published_at = now() WHERE transaction_id = $1 AND published_at IS NULL`, id)
+	if err != nil {
+		return fmt.Errorf("mark published: %w", err)
+	}
+	return nil
 }

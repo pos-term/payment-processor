@@ -42,11 +42,13 @@ erDiagram
         text status "success or failed"
         text reason "NULL on success"
         timestamptz processed_at
+        timestamptz published_at "NULL until the result is published to Kafka"
     }
 ```
 
 - `transactions`: the payment as the terminal sent it. A row never changes. The primary key `transaction_id` protects against duplicates.
 - `transaction_results`: the processing outcome. At most one result per transaction.
+- `published_at` in `transaction_results`: the result was delivered to `pos.transaction-results.v1` and the broker acknowledged it. While `NULL`, a replay of the record publishes the result again.
 - The `pending` status is not stored: no row in `transaction_results` means the payment is still being processed.
 - A terminal's history is served by the `(terminal_id, transaction_id DESC)` index: UUIDv7 is ordered by creation time.
 
@@ -101,7 +103,27 @@ The outcome of every valid transaction (`success` or `failed`) is published to `
 - what is published is what Postgres stores, not a fresh recomputation, so a republish gives exactly the same message;
 - `pending` is not published, the topic holds final statuses only; a message sent to the DLQ produces no result.
 
-Publishing completes with the broker acknowledgement (`acks=all`) and only then is the input offset committed. If publishing fails, the offset is not committed; the replay takes the stored result from Postgres and publishes it, the payment is not decided a second time. For now a repeated message with an already processed `transaction_id` publishes the stored result again: the terminal may receive a result more than once, but never loses it. The terminal ignores an already handled `transaction_id`.
+Publishing completes with the broker acknowledgement, details below.
+
+### Delivery guarantee (at-least-once)
+
+The input offset is committed only after the result is published and that is recorded in Postgres. The order is the same for every record:
+
+1. the result is stored in `transaction_results` (the decision is made once);
+2. the result is published, the broker acknowledged it (`acks=all`);
+3. `published_at` is written to Postgres;
+4. the input offset is committed.
+
+What happens on a crash:
+
+| Where it died | What the replay of the record does |
+|---|---|
+| before step 1 | processes the payment as new |
+| between 1 and 2 | takes the stored result and publishes it, the payment is not decided again |
+| between 2 and 3 | publishes the same stored result once more: the terminal may get it twice, but never loses it |
+| between 3 and 4 | sees `published_at`, publishes nothing, the offset is committed |
+
+A repeated message with an already delivered `transaction_id` therefore gives one row and one result. The terminal ignores a `transaction_id` it has already handled, so the rare second delivery of the "between 2 and 3" row is harmless. No transactional outbox is needed.
 
 ## Tests
 

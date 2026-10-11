@@ -175,6 +175,16 @@ func (s *memStore) SaveResult(_ context.Context, id, status string, reason *stri
 	return nil
 }
 
+func (s *memStore) MarkPublished(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r, ok := s.results[id]; ok {
+		r.Published = true
+		s.results[id] = r
+	}
+	return nil
+}
+
 func (s *memStore) GetResult(_ context.Context, id string) (storage.Result, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
