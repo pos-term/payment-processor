@@ -125,6 +125,23 @@ What happens on a crash:
 
 A repeated message with an already delivered `transaction_id` therefore gives one row and one result. The terminal ignores a `transaction_id` it has already handled, so the rare second delivery of the "between 2 and 3" row is harmless. No transactional outbox is needed.
 
+## Scaling out
+
+Up to three instances run in the same `payment-processor` consumer group and share the work without duplicates. More than three is pointless: `pos.transactions.v1` has three partitions and a partition is read by one instance of the group, the extra ones stay idle.
+
+- The message key is `terminal_id`: all payments of one terminal land in one partition, so they are processed in order and by one instance.
+- Instances join and leave on the fly: Kafka redistributes the partitions, and a record that was not committed in time goes to another instance. Nothing is lost or processed twice: a payment is decided once (Postgres), a delivered result is not published again (`published_at`).
+- Each instance needs its own `HTTP_ADDR`, the rest of the settings are shared.
+
+Three instances locally (the `infra` stack is running):
+
+```bash
+export KAFKA_BROKERS=localhost:9094 POSTGRES_DSN='postgres://pos:pos@localhost:5432/pos?sslmode=disable' REDIS_ADDR=localhost:6379 API_TOKEN=dev-token
+for i in 1 2 3; do HTTP_ADDR=:808$i go run ./cmd/payment-processor & done
+```
+
+The `payment-processor` service in `infra/docker-compose.yml` runs as a single instance: it has a fixed `container_name` and port, so `docker compose up --scale` does not work.
+
 ## Tests
 
 ```bash
