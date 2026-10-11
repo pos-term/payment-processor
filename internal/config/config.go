@@ -22,6 +22,9 @@ type Config struct {
 	RedisAddr       string
 	APIToken        string
 	MigrateOnStart  bool
+	DedupTTL        time.Duration
+	// MaxAmountMinor is the payment limit in minor units, 0 disables it.
+	MaxAmountMinor int64
 }
 
 // Load reads the configuration through lookup (os.LookupEnv in production).
@@ -37,6 +40,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		RedisAddr:       l.required("REDIS_ADDR"),
 		APIToken:        l.required("API_TOKEN"),
 	}
+	cfg.DedupTTL = l.duration("DEDUP_TTL", 24*time.Hour)
+	cfg.MaxAmountMinor = l.nonNegativeInt("MAX_AMOUNT_MINOR", 10_000_000)
 	cfg.MigrateOnStart = l.boolean("MIGRATE_ON_START", true)
 	cfg.LogLevel = l.logLevel("LOG_LEVEL", slog.LevelInfo)
 	cfg.KafkaBrokers = l.list("KAFKA_BROKERS")
@@ -98,6 +103,19 @@ func (l *loader) boolean(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+func (l *loader) nonNegativeInt(key string, def int64) int64 {
+	v := l.str(key, "")
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		l.fail(key, "must be a non-negative integer, got %q", v)
+		return def
+	}
+	return n
 }
 
 func (l *loader) duration(key string, def time.Duration) time.Duration {
