@@ -3,6 +3,7 @@ package consumer
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -13,15 +14,17 @@ import (
 
 // Default names from infra/docs/kafka.
 const (
-	DefaultGroup      = "payment-processor"
-	DefaultInputTopic = "pos.transactions.v1"
-	DefaultDLQTopic   = "pos.transactions.dlq.v1"
+	DefaultGroup        = "payment-processor"
+	DefaultInputTopic   = "pos.transactions.v1"
+	DefaultDLQTopic     = "pos.transactions.dlq.v1"
+	DefaultResultsTopic = "pos.transaction-results.v1"
 )
 
 const (
-	timeLayout = "2006-01-02T15:04:05.000Z" // RFC 3339, UTC, milliseconds
-	minBackoff = 200 * time.Millisecond
-	maxBackoff = 5 * time.Second
+	eventTypeProcessed = "transaction.processed"
+	timeLayout         = "2006-01-02T15:04:05.000Z" // RFC 3339, UTC, milliseconds
+	minBackoff         = 200 * time.Millisecond
+	maxBackoff         = 5 * time.Second
 )
 
 // Config of the Kafka side. Empty names fall back to the defaults.
@@ -30,6 +33,8 @@ type Config struct {
 	Group      string
 	InputTopic string
 	DLQTopic   string
+	// ResultsTopic receives the final result of every payment.
+	ResultsTopic string
 }
 
 // Record is one consumed Kafka message.
@@ -40,6 +45,16 @@ type Record struct {
 	Key       []byte
 	Value     []byte
 	Headers   map[string]string
+}
+
+// Result is the final outcome of a payment, published to the results topic for the terminal.
+type Result struct {
+	TransactionID string
+	TerminalID    string
+	Status        string  // success or failed
+	Reason        *string // nil on success
+	ProcessedAt   time.Time
+	TraceID       string // copied from the input message, empty when it had none
 }
 
 // DeadLetter is a message that can never be processed, whatever the number of retries.
@@ -63,7 +78,7 @@ type HandlerFunc func(ctx context.Context, rec Record) error
 // Handle implements Handler.
 func (f HandlerFunc) Handle(ctx context.Context, rec Record) error { return f(ctx, rec) }
 
-// Consumer reads, hands records to the Handler and commits. It also produces dead letters.
+// Consumer reads, hands records to the Handler and commits. It also produces results and dead letters.
 type Consumer struct {
 	cfg    Config
 	client *kgo.Client
@@ -77,6 +92,9 @@ func New(cfg Config, log *slog.Logger) (*Consumer, error) {
 	}
 	if cfg.InputTopic == "" {
 		cfg.InputTopic = DefaultInputTopic
+	}
+	if cfg.ResultsTopic == "" {
+		cfg.ResultsTopic = DefaultResultsTopic
 	}
 	if cfg.DLQTopic == "" {
 		cfg.DLQTopic = DefaultDLQTopic
@@ -193,7 +211,37 @@ func (c *Consumer) PublishDeadLetter(ctx context.Context, d DeadLetter) error {
 	if d.TransactionID != "" {
 		key = []byte(d.TransactionID)
 	}
-	r := &kgo.Record{Topic: c.cfg.DLQTopic, Key: key, Value: d.Record.Value, Headers: headers}
+	return c.produce(ctx, &kgo.Record{Topic: c.cfg.DLQTopic, Key: key, Value: d.Record.Value, Headers: headers})
+}
+
+// resultMessage is the pos.transaction-results.v1 value, see infra/schemas.
+type resultMessage struct {
+	SchemaVersion int     `json:"schema_version"`
+	TransactionID string  `json:"transaction_id"`
+	TerminalID    string  `json:"terminal_id"`
+	Status        string  `json:"status"`
+	Reason        *string `json:"reason"` // null on success
+	ProcessedAt   string  `json:"processed_at"`
+}
+
+// PublishResult writes the result keyed by terminal_id, so a terminal finds its own results and their
+// order is kept. It returns after the broker acknowledged: only then may the input offset be committed.
+func (c *Consumer) PublishResult(ctx context.Context, r Result) error {
+	value, err := json.Marshal(resultMessage{
+		SchemaVersion: 1, TransactionID: r.TransactionID, TerminalID: r.TerminalID,
+		Status: r.Status, Reason: r.Reason, ProcessedAt: r.ProcessedAt.UTC().Format(timeLayout),
+	})
+	if err != nil {
+		return fmt.Errorf("encode result: %w", err)
+	}
+	headers := []kgo.RecordHeader{{Key: "event_type", Value: []byte(eventTypeProcessed)}}
+	if r.TraceID != "" {
+		headers = append(headers, kgo.RecordHeader{Key: "trace_id", Value: []byte(r.TraceID)})
+	}
+	return c.produce(ctx, &kgo.Record{Topic: c.cfg.ResultsTopic, Key: []byte(r.TerminalID), Value: value, Headers: headers})
+}
+
+func (c *Consumer) produce(ctx context.Context, r *kgo.Record) error {
 	if err := c.client.ProduceSync(ctx, r).FirstErr(); err != nil {
 		return fmt.Errorf("produce to %s: %w", r.Topic, err)
 	}

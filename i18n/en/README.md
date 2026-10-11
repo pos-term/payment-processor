@@ -75,7 +75,7 @@ A valid transaction is stored in Postgres as `pending` (a row in `transactions` 
 | `success` | `NULL` | the amount is not above `MAX_AMOUNT_MINOR`, or the limit is off |
 | `failed` | `LIMIT_EXCEEDED` | the amount is above `MAX_AMOUNT_MINOR` |
 
-A declined payment is an ordinary business result and does not go to the DLQ. There is only one rule for now; the list of `reason` codes will grow together with INFRA#1. The outcome is written once: a second write does not change a stored result. If the service dies between storing the transaction and the result, the transaction stays `pending` and a replay of the same Kafka record completes it. Publishing the result is added by the next steps of epic PP#1.
+A declined payment is an ordinary business result and does not go to the DLQ. There is only one rule for now; the list of `reason` codes will grow together with INFRA#1. The outcome is written once: a second write does not change a stored result. If the service dies between storing the transaction and the result, the transaction stays `pending` and a replay of the same Kafka record completes it. The result is published to Kafka, see the next section.
 
 ## Deduplication
 
@@ -86,11 +86,22 @@ A terminal may retry a send, and a payment must not be processed twice. Two leve
 
 Redis is a hint, not a guarantee, so nothing depends on it:
 
-- A retry that Redis recognises is still checked against Postgres. Only a transaction with a stored result is skipped. Without a result (the service died after the Redis write but before the Postgres write, or in between), the retry finishes the payment.
+- A retry that Redis recognises is still checked against Postgres. For a transaction with a stored result the payment is not decided again and the stored result goes to the terminal. Without a result (the service died after the Redis write but before the Postgres write, or in between), the retry finishes the payment.
 - Redis flushed or the key expired: the id looks new again, but Postgres already knows the transaction and its result, so the payment is not decided a second time.
 - Redis unavailable: a warning in the log and Postgres alone does the job.
 
 The service also starts when Redis is down.
+
+## Publishing results
+
+The outcome of every valid transaction (`success` or `failed`) is published to `pos.transaction-results.v1`, so the terminal can show it to the customer:
+
+- key `terminal_id`, value per the [schema](https://github.com/pos-term/infra/blob/main/schemas/pos.transaction-results.v1.schema.json): `schema_version`, `transaction_id`, `terminal_id`, `status`, `reason` (`null` on success), `processed_at` (UTC, milliseconds);
+- headers `event_type = transaction.processed` and the same `trace_id` as the input message;
+- what is published is what Postgres stores, not a fresh recomputation, so a republish gives exactly the same message;
+- `pending` is not published, the topic holds final statuses only; a message sent to the DLQ produces no result.
+
+Publishing completes with the broker acknowledgement (`acks=all`) and only then is the input offset committed. If publishing fails, the offset is not committed; the replay takes the stored result from Postgres and publishes it, the payment is not decided a second time. For now a repeated message with an already processed `transaction_id` publishes the stored result again: the terminal may receive a result more than once, but never loses it. The terminal ignores an already handled `transaction_id`.
 
 ## Tests
 

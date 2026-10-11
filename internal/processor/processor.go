@@ -3,6 +3,7 @@ package processor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -19,8 +20,9 @@ const (
 // ReasonLimitExceeded is the reason code of a payment above the configured limit.
 const ReasonLimitExceeded = "LIMIT_EXCEEDED"
 
-// DeadLetterPublisher writes to the DLQ and returns after the broker acknowledged.
-type DeadLetterPublisher interface {
+// Publisher writes to Kafka and returns after the broker acknowledged.
+type Publisher interface {
+	PublishResult(ctx context.Context, r consumer.Result) error
 	PublishDeadLetter(ctx context.Context, d consumer.DeadLetter) error
 }
 
@@ -43,15 +45,15 @@ type Deduper interface {
 type Processor struct {
 	store          Store
 	dedup          Deduper
-	dlq            DeadLetterPublisher
+	pub            Publisher
 	maxAmountMinor int64
 	now            func() time.Time
 	log            *slog.Logger
 }
 
 // New builds a Processor. Payments above maxAmountMinor fail with LIMIT_EXCEEDED, 0 disables the limit.
-func New(store Store, dedup Deduper, dlq DeadLetterPublisher, maxAmountMinor int64, log *slog.Logger) *Processor {
-	return &Processor{store: store, dedup: dedup, dlq: dlq, maxAmountMinor: maxAmountMinor, now: time.Now, log: log}
+func New(store Store, dedup Deduper, pub Publisher, maxAmountMinor int64, log *slog.Logger) *Processor {
+	return &Processor{store: store, dedup: dedup, pub: pub, maxAmountMinor: maxAmountMinor, now: time.Now, log: log}
 }
 
 // Handle processes a pos.transactions.v1 record.
@@ -65,26 +67,29 @@ func (p *Processor) Handle(ctx context.Context, rec consumer.Record) error {
 		// A retry cannot fix this message: park it for a manual look, so the partition keeps moving.
 		p.log.Warn("bad message, sending to DLQ", "kind", bad.Kind, "detail", bad.Detail,
 			"partition", rec.Partition, "offset", rec.Offset)
-		return p.dlq.PublishDeadLetter(ctx, consumer.DeadLetter{
+		return p.pub.PublishDeadLetter(ctx, consumer.DeadLetter{
 			Record: rec, Kind: bad.Kind, Detail: bad.Detail, TransactionID: bad.TransactionID, At: p.now().UTC(),
 		})
 	}
 	log := p.log.With("transaction_id", tx.TransactionID, "terminal_id", tx.TerminalID, "trace_id", rec.Headers["trace_id"])
 
-	// Level 1, Redis
+	// Level 1, Redis: a cheap "have we seen this id" check. It is only a hint: Redis may be down,
+	// flushed, or hold an id whose processing never finished. Postgres below decides.
 	first, err := p.dedup.FirstSeen(ctx, tx.TransactionID)
 	if err != nil {
 		log.Warn("dedup filter unavailable, falling back to postgres", "error", err)
 		first = true
 	}
+	trace := rec.Headers["trace_id"]
 	if !first {
-		// Seen before, but only a stored result proves the earlier attempt finished.
-		// Without one the attempt died half way, so this record must finish the job.
-		if _, ok, err := p.store.GetResult(ctx, tx.TransactionID); err != nil {
+		// Seen before. A stored result means the payment is decided: do not decide it again, but hand
+		// the stored result to the terminal once more, because the earlier attempt may have died
+		// before publishing it. Without a stored result that attempt died half way: finish the job.
+		if res, ok, err := p.store.GetResult(ctx, tx.TransactionID); err != nil {
 			return err
 		} else if ok {
-			log.Info("duplicate, already processed")
-			return nil
+			log.Info("duplicate, republishing the stored result")
+			return p.publish(ctx, res, trace)
 		}
 	}
 
@@ -97,19 +102,37 @@ func (p *Processor) Handle(ctx context.Context, rec consumer.Record) error {
 	}); err != nil {
 		return err
 	}
-	if _, ok, err := p.store.GetResult(ctx, tx.TransactionID); err != nil {
-		return err
-	} else if ok {
-		log.Info("transaction already has a result")
-		return nil
-	}
-
-	status, reason := p.decide(tx)
-	if err := p.store.SaveResult(ctx, tx.TransactionID, status, reason, p.now().UTC()); err != nil {
+	res, ok, err := p.store.GetResult(ctx, tx.TransactionID)
+	if err != nil {
 		return err
 	}
-	log.Info("transaction processed", "status", status)
+	if !ok {
+		status, reason := p.decide(tx)
+		if err := p.store.SaveResult(ctx, tx.TransactionID, status, reason, p.now().UTC()); err != nil {
+			return err
+		}
+		// Read it back: when two writers race, the stored result is the one that counts,
+		// and a republish after a crash must carry exactly the same data.
+		if res, ok, err = p.store.GetResult(ctx, tx.TransactionID); err != nil {
+			return err
+		} else if !ok {
+			return fmt.Errorf("result of %s vanished after save", tx.TransactionID)
+		}
+	}
+	if err := p.publish(ctx, res, trace); err != nil {
+		return err
+	}
+	log.Info("transaction processed", "status", res.Status)
 	return nil
+}
+
+// publish hands the stored result to the terminal. An error leaves the offset uncommitted:
+// the replay finds the result in Postgres and publishes it without deciding anything again.
+func (p *Processor) publish(ctx context.Context, res storage.Result, traceID string) error {
+	return p.pub.PublishResult(ctx, consumer.Result{
+		TransactionID: res.TransactionID, TerminalID: res.TerminalID, Status: res.Status,
+		Reason: res.Reason, ProcessedAt: res.ProcessedAt, TraceID: traceID,
+	})
 }
 
 // decide is the business rule of the prototype: one amount limit.

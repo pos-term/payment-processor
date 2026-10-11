@@ -60,7 +60,7 @@ func TestTransactionsAreStoredWithStatus(t *testing.T) {
 
 	cfg := consumer.Config{
 		Brokers: strings.Split(brokers, ","), Group: "it-" + suffix,
-		InputTopic: "it.in." + suffix, DLQTopic: "it.dlq." + suffix,
+		InputTopic: "it.in." + suffix, DLQTopic: "it.dlq." + suffix, ResultsTopic: "it.out." + suffix,
 	}
 	cl, err := kgo.NewClient(kgo.SeedBrokers(cfg.Brokers...))
 	if err != nil {
@@ -68,12 +68,12 @@ func TestTransactionsAreStoredWithStatus(t *testing.T) {
 	}
 	defer cl.Close()
 	adm := kadm.NewClient(cl)
-	for topic, parts := range map[string]int32{cfg.InputTopic: 3, cfg.DLQTopic: 1} {
+	for topic, parts := range map[string]int32{cfg.InputTopic: 3, cfg.DLQTopic: 1, cfg.ResultsTopic: 1} {
 		if _, err := adm.CreateTopic(ctx, parts, 1, nil, topic); err != nil {
 			t.Fatal(err)
 		}
 	}
-	defer func() { _, _ = adm.DeleteTopics(ctx, cfg.InputTopic, cfg.DLQTopic) }()
+	defer func() { _, _ = adm.DeleteTopics(ctx, cfg.InputTopic, cfg.DLQTopic, cfg.ResultsTopic) }()
 
 	const (
 		okID, bigID = "0192f0c4-7a3e-7b21-9d4e-000000000001", "0192f0c4-7a3e-7b21-9d4e-000000000002"

@@ -84,7 +84,7 @@ func setupDedup(t *testing.T, redisAddr string) *dedupEnv {
 		redis: redis.NewClient(&redis.Options{Addr: redisAddr, DialTimeout: 200 * time.Millisecond, MaxRetries: -1}),
 		cfg: consumer.Config{
 			Brokers: strings.Split(brokers, ","), Group: "it-" + suffix,
-			InputTopic: "it.in." + suffix, DLQTopic: "it.dlq." + suffix,
+			InputTopic: "it.in." + suffix, DLQTopic: "it.dlq." + suffix, ResultsTopic: "it.out." + suffix,
 		},
 	}
 	t.Cleanup(func() { e.redis.Close() })
@@ -93,12 +93,12 @@ func setupDedup(t *testing.T, redisAddr string) *dedupEnv {
 	}
 	t.Cleanup(e.cl.Close)
 	adm := kadm.NewClient(e.cl)
-	for topic, parts := range map[string]int32{e.cfg.InputTopic: 3, e.cfg.DLQTopic: 1} {
+	for topic, parts := range map[string]int32{e.cfg.InputTopic: 3, e.cfg.DLQTopic: 1, e.cfg.ResultsTopic: 1} {
 		if _, err := adm.CreateTopic(ctx, parts, 1, nil, topic); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Cleanup(func() { _, _ = adm.DeleteTopics(ctx, e.cfg.InputTopic, e.cfg.DLQTopic) })
+	t.Cleanup(func() { _, _ = adm.DeleteTopics(ctx, e.cfg.InputTopic, e.cfg.DLQTopic, e.cfg.ResultsTopic) })
 
 	cons, err := consumer.New(e.cfg, log)
 	if err != nil {

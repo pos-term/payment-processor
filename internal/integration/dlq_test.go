@@ -42,7 +42,7 @@ func TestBadMessagesReachDLQAndPartitionKeepsMoving(t *testing.T) {
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	cfg := consumer.Config{
 		Brokers: strings.Split(brokers, ","), Group: "it-" + suffix,
-		InputTopic: "it.in." + suffix, DLQTopic: "it.dlq." + suffix,
+		InputTopic: "it.in." + suffix, DLQTopic: "it.dlq." + suffix, ResultsTopic: "it.out." + suffix,
 	}
 	ctx := context.Background()
 
@@ -52,12 +52,12 @@ func TestBadMessagesReachDLQAndPartitionKeepsMoving(t *testing.T) {
 	}
 	defer cl.Close()
 	adm := kadm.NewClient(cl)
-	for topic, parts := range map[string]int32{cfg.InputTopic: 3, cfg.DLQTopic: 1} {
+	for topic, parts := range map[string]int32{cfg.InputTopic: 3, cfg.DLQTopic: 1, cfg.ResultsTopic: 1} {
 		if _, err := adm.CreateTopic(ctx, parts, 1, nil, topic); err != nil {
 			t.Fatal(err)
 		}
 	}
-	defer func() { _, _ = adm.DeleteTopics(ctx, cfg.InputTopic, cfg.DLQTopic) }()
+	defer func() { _, _ = adm.DeleteTopics(ctx, cfg.InputTopic, cfg.DLQTopic, cfg.ResultsTopic) }()
 
 	// One terminal, one partition: the order is fixed. The valid message comes last, behind three bad ones.
 	trace := []kgo.RecordHeader{{Key: "trace_id", Value: []byte("trace-abc")}}
@@ -78,7 +78,7 @@ func TestBadMessagesReachDLQAndPartitionKeepsMoving(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proc := processor.New(&noStore{}, noDedup{}, cons, 0, log)
+	proc := processor.New(newMemStore(), noDedup{}, cons, 0, log)
 	var mu sync.Mutex
 	handled := 0
 	runCtx, cancel := context.WithCancel(ctx)
@@ -149,15 +149,37 @@ func TestBadMessagesReachDLQAndPartitionKeepsMoving(t *testing.T) {
 	}
 }
 
-// noStore stands in for Postgres: this test is about the DLQ, not about storage.
-type noStore struct{}
-
-func (noStore) InsertTransaction(context.Context, storage.Transaction) (bool, error) {
-	return true, nil
+// memStore stands in for Postgres: this test is about the DLQ, not about storage.
+type memStore struct {
+	mu      sync.Mutex
+	txs     map[string]storage.Transaction
+	results map[string]storage.Result
 }
-func (noStore) SaveResult(context.Context, string, string, *string, time.Time) error { return nil }
-func (noStore) GetResult(context.Context, string) (storage.Result, bool, error) {
-	return storage.Result{}, false, nil
+
+func newMemStore() *memStore {
+	return &memStore{txs: map[string]storage.Transaction{}, results: map[string]storage.Result{}}
+}
+
+func (s *memStore) InsertTransaction(_ context.Context, tx storage.Transaction) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, known := s.txs[tx.ID]
+	s.txs[tx.ID] = tx
+	return !known, nil
+}
+
+func (s *memStore) SaveResult(_ context.Context, id, status string, reason *string, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.results[id] = storage.Result{TransactionID: id, TerminalID: s.txs[id].TerminalID, Status: status, Reason: reason, ProcessedAt: at}
+	return nil
+}
+
+func (s *memStore) GetResult(_ context.Context, id string) (storage.Result, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.results[id]
+	return r, ok, nil
 }
 
 // noDedup says every id is new: Postgres alone decides.

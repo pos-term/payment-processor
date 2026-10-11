@@ -70,7 +70,18 @@ func (s *memStore) GetResult(_ context.Context, id string) (storage.Result, bool
 
 type memDLQ struct {
 	letters []consumer.DeadLetter
-	err     error
+	results []consumer.Result
+	err     error // DLQ publish error
+	failRes int   // PublishResult fails this many times
+}
+
+func (m *memDLQ) PublishResult(_ context.Context, r consumer.Result) error {
+	if m.failRes > 0 {
+		m.failRes--
+		return errBoom
+	}
+	m.results = append(m.results, r)
+	return nil
 }
 
 func (m *memDLQ) PublishDeadLetter(_ context.Context, d consumer.DeadLetter) error {
@@ -316,5 +327,82 @@ func TestDifferentTransactionsAreNotDeduplicated(t *testing.T) {
 	}
 	if len(store.txs) != 2 || store.saves != 2 {
 		t.Errorf("%d txs, %d decisions; want 2 each", len(store.txs), store.saves)
+	}
+}
+
+func TestNewPaymentPublishesItsResult(t *testing.T) {
+	store, pub := newMemStore(), &memDLQ{}
+	if err := newProc(store, pub, 0).Handle(context.Background(), rec(validTx)); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pub.results) != 1 {
+		t.Fatalf("published %d results, want 1", len(pub.results))
+	}
+	r := pub.results[0]
+	if r.TransactionID != txID || r.TerminalID != "term-001" || r.Status != StatusSuccess || r.Reason != nil {
+		t.Errorf("unexpected result: %+v", r)
+	}
+	if r.TraceID != "trace-1" {
+		t.Errorf("trace_id = %q, want the one of the input message", r.TraceID)
+	}
+	if !r.ProcessedAt.Equal(store.results[txID].ProcessedAt) {
+		t.Error("the published time must be the stored time")
+	}
+}
+
+func TestFailedPaymentPublishesItsReason(t *testing.T) {
+	pub := &memDLQ{}
+	if err := newProc(newMemStore(), pub, 10000).Handle(context.Background(), rec(validTx)); err != nil {
+		t.Fatal(err)
+	}
+	r := pub.results[0]
+	if r.Status != StatusFailed || r.Reason == nil || *r.Reason != ReasonLimitExceeded {
+		t.Errorf("unexpected result: %+v", r)
+	}
+}
+
+func TestBadMessagePublishesNoResult(t *testing.T) {
+	pub := &memDLQ{}
+	if err := newProc(newMemStore(), pub, 0).Handle(context.Background(), rec(`not json`)); err != nil {
+		t.Fatal(err)
+	}
+	if len(pub.results) != 0 {
+		t.Errorf("a dead letter is not a payment result: %+v", pub.results)
+	}
+}
+
+// The publish fails after the result is stored: the offset stays uncommitted, the replay publishes the
+// stored result and does not decide the payment a second time.
+func TestPublishFailureIsRetriedWithoutDecidingAgain(t *testing.T) {
+	store, pub := newMemStore(), &memDLQ{failRes: 1}
+	p := newProc(store, pub, 0)
+
+	if err := p.Handle(context.Background(), rec(validTx)); !errors.Is(err, errBoom) {
+		t.Fatalf("err = %v, want the publish error so the offset stays uncommitted", err)
+	}
+	if len(pub.results) != 0 {
+		t.Fatal("nothing must be published by the failed attempt")
+	}
+	if err := p.Handle(context.Background(), rec(validTx)); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(pub.results) != 1 || store.saves != 1 {
+		t.Errorf("%d published, %d decisions; want 1 each", len(pub.results), store.saves)
+	}
+}
+
+// Until step 6 records the delivery, a duplicate republishes the stored result: a result may be
+// delivered more than once, never lost, and never recomputed.
+func TestDuplicateRepublishesTheStoredResult(t *testing.T) {
+	store, pub := newMemStore(), &memDLQ{}
+	handleTwice(t, newProc(store, pub, 0), nil)
+
+	if len(pub.results) != 2 || pub.results[0] != pub.results[1] {
+		t.Errorf("results = %+v; want the same result twice", pub.results)
+	}
+	if store.saves != 1 {
+		t.Errorf("decisions = %d, want 1", store.saves)
 	}
 }
