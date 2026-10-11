@@ -52,7 +52,19 @@ erDiagram
 
 The service reads `pos.transactions.v1` in the `payment-processor` consumer group with manual offset commits (`enable.auto.commit=false`). An offset is committed only for records the handler finished without an error, so no event is lost on restart. A transient handler error is retried with a growing pause; the record is neither skipped nor committed. A new group reads the topic from the beginning.
 
-For now the handler is a stub that only writes the record to the debug log. Payment processing is added by the next steps of epic PP#1.
+## Invalid messages (DLQ)
+
+A message that a retry cannot fix goes to `pos.transactions.dlq.v1`; then its offset is committed and the partition keeps moving:
+
+| `error` | When |
+|---|---|
+| `invalid_json` | the value is not parseable JSON |
+| `unsupported_schema_version` | `schema_version` is not `1` (checked before the other fields) |
+| `validation_failed` | fields do not match the [schema](https://github.com/pos-term/infra/blob/main/schemas/pos.transactions.v1.schema.json): format, range, an extra or a missing field |
+
+The DLQ gets the original bytes unchanged. Key: `transaction_id` if it could be read, otherwise empty. Headers: `error`, `error_detail`, `original_topic`, `original_partition`, `original_offset`, `failed_at`, and `trace_id` when present. If the DLQ itself is unavailable, the offset is not committed and the message is retried: it is not lost.
+
+For now a valid transaction is only written to the debug log. The rest of payment processing is added by the next steps of epic PP#1.
 
 ## Tests
 

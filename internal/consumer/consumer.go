@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -14,9 +15,11 @@ import (
 const (
 	DefaultGroup      = "payment-processor"
 	DefaultInputTopic = "pos.transactions.v1"
+	DefaultDLQTopic   = "pos.transactions.dlq.v1"
 )
 
 const (
+	timeLayout = "2006-01-02T15:04:05.000Z" // RFC 3339, UTC, milliseconds
 	minBackoff = 200 * time.Millisecond
 	maxBackoff = 5 * time.Second
 )
@@ -26,6 +29,7 @@ type Config struct {
 	Brokers    []string
 	Group      string
 	InputTopic string
+	DLQTopic   string
 }
 
 // Record is one consumed Kafka message.
@@ -36,6 +40,15 @@ type Record struct {
 	Key       []byte
 	Value     []byte
 	Headers   map[string]string
+}
+
+// DeadLetter is a message that can never be processed, whatever the number of retries.
+type DeadLetter struct {
+	Record        Record
+	Kind          string // value of the `error` header: invalid_json, validation_failed, ...
+	Detail        string
+	TransactionID string // best effort, empty when unreadable: the DLQ key
+	At            time.Time
 }
 
 // Handler processes one record. A nil return means the offset may be committed;
@@ -50,7 +63,7 @@ type HandlerFunc func(ctx context.Context, rec Record) error
 // Handle implements Handler.
 func (f HandlerFunc) Handle(ctx context.Context, rec Record) error { return f(ctx, rec) }
 
-// Consumer reads, hands records to the Handler and commits.
+// Consumer reads, hands records to the Handler and commits. It also produces dead letters.
 type Consumer struct {
 	cfg    Config
 	client *kgo.Client
@@ -65,6 +78,9 @@ func New(cfg Config, log *slog.Logger) (*Consumer, error) {
 	if cfg.InputTopic == "" {
 		cfg.InputTopic = DefaultInputTopic
 	}
+	if cfg.DLQTopic == "" {
+		cfg.DLQTopic = DefaultDLQTopic
+	}
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.ConsumerGroup(cfg.Group),
@@ -74,6 +90,7 @@ func New(cfg Config, log *slog.Logger) (*Consumer, error) {
 		kgo.DisableAutoCommit(),
 		// No rebalance while a polled batch is being processed, offsets are committed first.
 		kgo.BlockRebalanceOnPoll(),
+		kgo.RequiredAcks(kgo.AllISRAcks()),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create kafka client: %w", err)
@@ -156,4 +173,29 @@ func (c *Consumer) commit(done map[int32]*kgo.Record) {
 		// Harmless once records are deduplicated: they are replayed.
 		c.log.Warn("offset commit failed", "error", err)
 	}
+}
+
+// PublishDeadLetter writes the original bytes to the DLQ topic and returns after the broker acknowledged.
+// The key is the transaction_id when it could be read, the headers say what was wrong and where it came from.
+func (c *Consumer) PublishDeadLetter(ctx context.Context, d DeadLetter) error {
+	headers := []kgo.RecordHeader{
+		{Key: "error", Value: []byte(d.Kind)},
+		{Key: "error_detail", Value: []byte(d.Detail)},
+		{Key: "original_topic", Value: []byte(d.Record.Topic)},
+		{Key: "original_partition", Value: []byte(strconv.Itoa(int(d.Record.Partition)))},
+		{Key: "original_offset", Value: []byte(strconv.FormatInt(d.Record.Offset, 10))},
+		{Key: "failed_at", Value: []byte(d.At.UTC().Format(timeLayout))},
+	}
+	if trace := d.Record.Headers["trace_id"]; trace != "" {
+		headers = append(headers, kgo.RecordHeader{Key: "trace_id", Value: []byte(trace)})
+	}
+	var key []byte
+	if d.TransactionID != "" {
+		key = []byte(d.TransactionID)
+	}
+	r := &kgo.Record{Topic: c.cfg.DLQTopic, Key: key, Value: d.Record.Value, Headers: headers}
+	if err := c.client.ProduceSync(ctx, r).FirstErr(); err != nil {
+		return fmt.Errorf("produce to %s: %w", r.Topic, err)
+	}
+	return nil
 }
