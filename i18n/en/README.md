@@ -18,6 +18,7 @@ The service is configured through environment variables.
 | `LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error` |
 | `SHUTDOWN_TIMEOUT` | no | `10s` | Time allowed for a graceful shutdown |
 | `MIGRATE_ON_START` | no | `true` | Apply Postgres migrations on startup |
+| `MAX_AMOUNT_MINOR` | no | `10000000` | Payment limit in minor units (kopecks for RUB): above it the payment is `failed` with `LIMIT_EXCEEDED`. `0` disables the limit |
 
 ## Database
 
@@ -64,7 +65,16 @@ A message that a retry cannot fix goes to `pos.transactions.dlq.v1`; then its of
 
 The DLQ gets the original bytes unchanged. Key: `transaction_id` if it could be read, otherwise empty. Headers: `error`, `error_detail`, `original_topic`, `original_partition`, `original_offset`, `failed_at`, and `trace_id` when present. If the DLQ itself is unavailable, the offset is not committed and the message is retried: it is not lost.
 
-For now a valid transaction is only written to the debug log. The rest of payment processing is added by the next steps of epic PP#1.
+## Transaction statuses
+
+A valid transaction is stored in Postgres as `pending` (a row in `transactions` without a row in `transaction_results`) and then gets its outcome:
+
+| Status | `reason` | When |
+|---|---|---|
+| `success` | `NULL` | the amount is not above `MAX_AMOUNT_MINOR`, or the limit is off |
+| `failed` | `LIMIT_EXCEEDED` | the amount is above `MAX_AMOUNT_MINOR` |
+
+A declined payment is an ordinary business result and does not go to the DLQ. There is only one rule for now; the list of `reason` codes will grow together with INFRA#1. The outcome is written once: a second write does not change a stored result. If the service dies between storing the transaction and the result, the transaction stays `pending` and a replay of the same Kafka record completes it. Publishing the result is added by the next steps of epic PP#1.
 
 ## Tests
 

@@ -44,13 +44,19 @@ func run() error {
 		}
 	}
 
+	store, err := storage.Open(ctx, cfg.PostgresDSN)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
 	cons, err := consumer.New(consumer.Config{Brokers: cfg.KafkaBrokers}, log)
 	if err != nil {
 		return err
 	}
 	defer cons.Close()
 
-	proc := processor.New(cons, log)
+	proc := processor.New(store, cons, cfg.MaxAmountMinor, log)
 
 	// Either part failing stops the other one.
 	g, gctx := errgroup.WithContext(ctx)

@@ -18,6 +18,7 @@ import (
 
 	"github.com/pos-term/payment-processor/internal/consumer"
 	"github.com/pos-term/payment-processor/internal/processor"
+	"github.com/pos-term/payment-processor/internal/storage"
 )
 
 const validTx = `{"schema_version":1,"transaction_id":"0192f0c4-7a3e-7b21-9d4e-2c1f8a6b5e10","terminal_id":"term-001",` +
@@ -77,7 +78,7 @@ func TestBadMessagesReachDLQAndPartitionKeepsMoving(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proc := processor.New(cons, log)
+	proc := processor.New(&noStore{}, cons, 0, log)
 	var mu sync.Mutex
 	handled := 0
 	runCtx, cancel := context.WithCancel(ctx)
@@ -146,4 +147,15 @@ func TestBadMessagesReachDLQAndPartitionKeepsMoving(t *testing.T) {
 	if string(dlq[1].Key) != "0192f0c4-7a3e-7b21-9d4e-2c1f8a6b5e10" {
 		t.Errorf("dlq[1] key = %q, want the transaction_id", dlq[1].Key)
 	}
+}
+
+// noStore stands in for Postgres: this test is about the DLQ, not about storage.
+type noStore struct{}
+
+func (noStore) InsertTransaction(context.Context, storage.Transaction) (bool, error) {
+	return true, nil
+}
+func (noStore) SaveResult(context.Context, string, string, *string, time.Time) error { return nil }
+func (noStore) GetResult(context.Context, string) (storage.Result, bool, error) {
+	return storage.Result{}, false, nil
 }

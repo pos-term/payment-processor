@@ -7,24 +7,43 @@ import (
 	"time"
 
 	"github.com/pos-term/payment-processor/internal/consumer"
+	"github.com/pos-term/payment-processor/internal/storage"
 )
+
+// Result statuses, as stored. A transaction without a result is pending.
+const (
+	StatusSuccess = "success"
+	StatusFailed  = "failed"
+)
+
+// ReasonLimitExceeded is the reason code of a payment above the configured limit.
+const ReasonLimitExceeded = "LIMIT_EXCEEDED"
 
 // DeadLetterPublisher writes to the DLQ and returns after the broker acknowledged.
 type DeadLetterPublisher interface {
 	PublishDeadLetter(ctx context.Context, d consumer.DeadLetter) error
 }
 
+// Store is the Postgres source of truth.
+type Store interface {
+	InsertTransaction(ctx context.Context, tx storage.Transaction) (bool, error)
+	SaveResult(ctx context.Context, id, status string, reason *string, processedAt time.Time) error
+	GetResult(ctx context.Context, id string) (storage.Result, bool, error)
+}
+
 // Processor handles one record at a time. Handle returns nil only when the record needs no
 // further work, so the consumer may commit its offset. Any other error is transient: retry, do not commit.
 type Processor struct {
-	dlq DeadLetterPublisher
-	now func() time.Time
-	log *slog.Logger
+	store          Store
+	dlq            DeadLetterPublisher
+	maxAmountMinor int64
+	now            func() time.Time
+	log            *slog.Logger
 }
 
-// New builds a Processor.
-func New(dlq DeadLetterPublisher, log *slog.Logger) *Processor {
-	return &Processor{dlq: dlq, now: time.Now, log: log}
+// New builds a Processor. Payments above maxAmountMinor fail with LIMIT_EXCEEDED, 0 disables the limit.
+func New(store Store, dlq DeadLetterPublisher, maxAmountMinor int64, log *slog.Logger) *Processor {
+	return &Processor{store: store, dlq: dlq, maxAmountMinor: maxAmountMinor, now: time.Now, log: log}
 }
 
 // Handle processes a pos.transactions.v1 record.
@@ -42,7 +61,36 @@ func (p *Processor) Handle(ctx context.Context, rec consumer.Record) error {
 			Record: rec, Kind: bad.Kind, Detail: bad.Detail, TransactionID: bad.TransactionID, At: p.now().UTC(),
 		})
 	}
-	// Placeholder until the storage and dedup steps land.
-	p.log.Debug("valid transaction", "transaction_id", tx.TransactionID, "terminal_id", tx.TerminalID)
+	log := p.log.With("transaction_id", tx.TransactionID, "terminal_id", tx.TerminalID, "trace_id", rec.Headers["trace_id"])
+
+	// pending: the transaction is stored, no result yet. A crash from here on leaves it pending;
+	// the replay of this record completes it.
+	if _, err := p.store.InsertTransaction(ctx, storage.Transaction{
+		ID: tx.TransactionID, TerminalID: tx.TerminalID, AmountMinor: tx.AmountMinor,
+		Currency: tx.Currency, Seq: tx.Seq, CreatedAt: tx.CreatedAt,
+	}); err != nil {
+		return err
+	}
+	if _, ok, err := p.store.GetResult(ctx, tx.TransactionID); err != nil {
+		return err
+	} else if ok {
+		log.Info("transaction already has a result")
+		return nil
+	}
+
+	status, reason := p.decide(tx)
+	if err := p.store.SaveResult(ctx, tx.TransactionID, status, reason, p.now().UTC()); err != nil {
+		return err
+	}
+	log.Info("transaction processed", "status", status)
 	return nil
+}
+
+// decide is the business rule of the prototype: one amount limit.
+func (p *Processor) decide(tx Transaction) (string, *string) {
+	if p.maxAmountMinor > 0 && tx.AmountMinor > p.maxAmountMinor {
+		reason := ReasonLimitExceeded
+		return StatusFailed, &reason
+	}
+	return StatusSuccess, nil
 }
