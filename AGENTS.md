@@ -4,7 +4,7 @@ Guidance for AI coding agents working in `payment-processor`. The behaviour of t
 
 ## What this is
 
-A Go service (module `github.com/pos-term/payment-processor`, Go 1.26) that consumes payment transactions from Kafka, decides them, stores everything in Postgres, publishes results back to Kafka and (eventually) serves a REST API. Redis is used only as a fast duplicate filter.
+A Go service (module `github.com/pos-term/payment-processor`, Go 1.26) that consumes payment transactions from Kafka, decides them, stores everything in Postgres, publishes results back to Kafka and serves a read-only REST API. Redis is used only as a fast duplicate filter.
 
 Part of the [pos-term](https://github.com/pos-term) organization: a system for accepting and reliably processing payment transactions with a POS terminal emulator (project description and team: [.github profile](https://github.com/pos-term/.github/blob/main/profile/README.md), in Russian). The target is a working prototype by December 2026. Sibling repos, expected to be checked out next to this one:
 
@@ -118,12 +118,12 @@ Keep this section current: tick items in the same PR that finishes them.
 - [x] Publishing results to `pos.transaction-results.v1` with at-least-once delivery
 - [x] Scale-out to 3 instances verified by integration test
 - [x] Integration tests: dedup, DLQ, results, status, scale
+- [x] REST API: `GET /v1/transactions/{transaction_id}`, `GET /v1/transactions` (filters, cursor pagination), `GET /v1/terminals`, problem+json errors
+- [x] Bearer-token auth for `/v1/*` (`/healthz` stays open)
 
 ### To do
 
-- [ ] REST API from [infra/api/openapi.yaml](https://github.com/pos-term/infra/blob/main/api/openapi.yaml): only `GET /healthz` exists. Missing: `GET /v1/transactions`, `GET /v1/transactions/{transaction_id}`, `GET /v1/transactions/stream`, `GET /v1/terminals`
-- [ ] Bearer-token auth for the API: `API_TOKEN` is required and validated but nothing checks it yet (`/healthz` must stay open)
-- [ ] Terminal history endpoint on top of the existing index `(terminal_id, transaction_id DESC)` with pagination
+- [ ] `GET /v1/transactions/stream` (SSE) from [infra/api/openapi.yaml](https://github.com/pos-term/infra/blob/main/api/openapi.yaml): events fanned out through Redis, `Last-Event-ID` replay, `resync`, 15 s keep-alive. Until it exists, `/v1/transactions/stream` is answered by the `{transaction_id}` route with `400`
 - [ ] More business rules and `reason` codes (the list is to be extended together with INFRA#1; today only `LIMIT_EXCEEDED`)
 - [ ] Readiness probe (Postgres / Kafka reachability) separate from the liveness `/healthz`
 - [ ] Metrics (processed / failed / DLQ counts, consumer lag, retry count)

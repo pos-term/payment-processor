@@ -22,7 +22,9 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Run(ctx, New(addr, discardLogger()), time.Second, discardLogger()) }()
+	go func() {
+		done <- Run(ctx, New(addr, testToken, &fakeStore{}, discardLogger()), time.Second, discardLogger())
+	}()
 
 	// Wait until the server answers, then cancel and expect a clean exit.
 	deadline := time.Now().Add(2 * time.Second)

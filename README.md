@@ -142,6 +142,24 @@ for i in 1 2 3; do HTTP_ADDR=:808$i go run ./cmd/payment-processor & done
 
 Сервис `payment-processor` в `infra/docker-compose.yml` запускается в одном экземпляре: у него фиксированные `container_name` и порт, поэтому `docker compose up --scale` не сработает.
 
+## REST API
+
+Только чтение, для приложения кассира. Данные берутся из Postgres, поэтому все экземпляры отвечают одинаково. Контракт: [openapi.yaml](https://github.com/pos-term/infra/blob/main/api/openapi.yaml).
+
+| Метод и путь | Что отдаёт |
+|---|---|
+| `GET /healthz` | liveness, токен не нужен |
+| `GET /v1/transactions/{transaction_id}` | статус одной транзакции; `pending`, пока нет результата |
+| `GET /v1/transactions` | история, новые первыми. Фильтры `terminal_id`, `status`, `from`, `to`, страница `limit` (1–200, по умолчанию 50) и `cursor` |
+| `GET /v1/terminals` | терминалы, приславшие хотя бы одну транзакцию |
+
+`GET /v1/transactions/stream` (SSE) ещё не реализован.
+
+- **Токен.** Все пути `/v1/*` требуют `Authorization: Bearer <API_TOKEN>`. Без токена или с неверным: `401` и `WWW-Authenticate: Bearer`, параметры при этом не проверяются.
+- **Ошибки.** `application/problem+json` (RFC 9457) с полем `code`: `invalid_parameter` (400), `unauthorized` (401), `not_found` (404), `internal_error` (500). Подробности внутренней ошибки только в логе, клиенту они не уходят.
+- **Пагинация.** Порядок по `transaction_id` по убыванию (UUIDv7, то есть по времени создания). `next_cursor` непрозрачный: клиент передаёт его как `cursor` и получает следующую страницу, на последней странице он `null`. Страница не «съезжает», если приходят новые транзакции: курсор указывает на конкретный id.
+- **Время.** UTC с миллисекундами. `from` включительно, `to` не включительно, оба по `created_at` (время терминала).
+
 ## Тесты
 
 ```bash
