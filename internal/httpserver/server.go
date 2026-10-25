@@ -9,11 +9,11 @@ import (
 	"time"
 )
 
-// New builds the HTTP server around the route table.
-func New(addr string, log *slog.Logger) *http.Server {
+// New builds the HTTP server around the route table. The API requires the bearer token.
+func New(addr, token string, store Store, log *slog.Logger) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           routes(),
+		Handler:           routes(token, store, log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelError),
 	}

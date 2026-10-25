@@ -70,7 +70,7 @@ func run() error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return cons.Run(gctx, proc) })
 	g.Go(func() error {
-		return httpserver.Run(gctx, httpserver.New(cfg.HTTPAddr, log), cfg.ShutdownTimeout, log)
+		return httpserver.Run(gctx, httpserver.New(cfg.HTTPAddr, cfg.APIToken, store, log), cfg.ShutdownTimeout, log)
 	})
 	return g.Wait()
 }
