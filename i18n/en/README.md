@@ -151,9 +151,9 @@ Read-only, for the cashier app. Data comes from Postgres, so every instance answ
 | `GET /healthz` | liveness, no token needed |
 | `GET /v1/transactions/{transaction_id}` | status of one transaction; `pending` until a result exists |
 | `GET /v1/transactions` | history, newest first. Filters `terminal_id`, `status`, `transaction_id_prefix`, `min_amount_minor`, `max_amount_minor`, `currency`, `reason`, `from`, `to`; paging with `limit` (1–200, default 50) and `cursor` |
+| `GET /v1/transactions/stream` | SSE: status changes, replay and `terminal_id`, `status` filters |
 | `GET /v1/terminals` | terminals that have sent at least one transaction |
 
-`GET /v1/transactions/stream` (SSE) is not implemented yet.
 
 - **Token.** Every `/v1/*` path requires `Authorization: Bearer <API_TOKEN>`. A missing or wrong token gives `401` with `WWW-Authenticate: Bearer`, and parameters are not validated first.
 - **Errors.** `application/problem+json` (RFC 9457) with a `code` field: `invalid_parameter` (400), `unauthorized` (401), `not_found` (404), `internal_error` (500). Details of an internal error go to the log only, never to the client.
@@ -161,10 +161,25 @@ Read-only, for the cashier app. Data comes from Postgres, so every instance answ
 - **Pagination.** Filters apply before the page limit; clients repeat the same filters when following a cursor. Ordered by `transaction_id` descending (UUIDv7, i.e. creation order). `next_cursor` is opaque: the client passes it back as `cursor` to get the next page, and it is `null` on the last page. Pages do not shift when new transactions arrive, because the cursor points at a concrete id.
 - **Time.** UTC with milliseconds. `from` is inclusive, `to` is exclusive, both on `created_at` (terminal time).
 
+## Event stream (SSE)
+
+`GET /v1/transactions/stream` requires the same Bearer token. A `transaction.updated` event contains a transaction in the REST JSON format: first `pending`, then `success` or `failed`. Optional `terminal_id` matches exactly; `status` accepts one value (`pending`, `success`, `failed`) and cannot be repeated for SSE. A `: keep-alive` comment is sent every 15 seconds. Slow connections close after the 5-second write deadline.
+
+All instances share Redis Stream `pos:transaction-events:v1`, retaining approximately the last 10,000 events. Each subscriber reads its own position, so all subscribers receive events. Servers poll every 250 ms. Reconnect using the saved event `id` in `Last-Event-ID`, including when switching instances. IDs are opaque and include the journal generation and ordered Redis ID. Without `Last-Event-ID`, streaming starts at the current journal tail. On initial load, clients open the stream and buffer events before fetching history, then apply the buffered updates.
+
+An expired or unknown cursor, or a lost journal, produces `resync` with a new position. The client reloads history using `GET /v1/transactions` and continues streaming. Resync is also sent after instance startup, replay of a stored transaction and notification recovery. When Redis becomes unavailable the connection receives `resync`; recovery sends another with the current position.
+
+Notifications update the UI and may repeat; clients replace transaction state by `transaction_id`. Postgres remains the source of truth. Postgres writes and notifications do not share a transaction: failures may omit intermediate snapshots from the journal, recovered through `resync` and REST. A background task retries failed invalidations every second even without new payments. Redis failure does not stop payments or Kafka result delivery. Clients reconnecting without a saved ID also load history.
+
+```bash
+curl -N -H 'Authorization: Bearer dev-token' \
+  'http://localhost:8080/v1/transactions/stream?terminal_id=term-001'
+```
+
 ## Tests
 
 ```bash
-go test ./...   # tests that need Kafka or Postgres are skipped without the variables below
+go test ./...   # tests that need Kafka, Postgres or Redis are skipped without the variables below
 docker compose -f ../infra/docker-compose.yml up -d kafka kafka-init postgres redis
 TEST_KAFKA_BROKERS=localhost:9094 TEST_POSTGRES_DSN='postgres://pos:pos@localhost:5432/pos?sslmode=disable' TEST_REDIS_ADDR=localhost:6379 go test -race ./...
 ```

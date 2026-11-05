@@ -41,9 +41,27 @@ type Deduper interface {
 	FirstSeen(ctx context.Context, transactionID string) (bool, error)
 }
 
+// Events is a best-effort UI notification sink; Postgres remains the source of truth.
+type Events interface {
+	TransactionUpdated(context.Context, string) error
+	Invalidate()
+}
+
+// WithEvents enables transaction notifications independently of Kafka result delivery.
+func (p *Processor) WithEvents(events Events) *Processor { p.events = events; return p }
+
+func (p *Processor) notify(ctx context.Context, log *slog.Logger, id string) {
+	if p.events != nil {
+		if err := p.events.TransactionUpdated(ctx, id); err != nil {
+			log.Warn("SSE notification unavailable", "error", err)
+		}
+	}
+}
+
 // Processor handles one record at a time. Handle returns nil only when the record needs no
 // further work, so the consumer may commit its offset. Any other error is transient: retry, do not commit.
 type Processor struct {
+	events         Events
 	store          Store
 	dedup          Deduper
 	pub            Publisher
@@ -89,6 +107,10 @@ func (p *Processor) Handle(ctx context.Context, rec consumer.Record) error {
 		if res, ok, err := p.store.GetResult(ctx, tx.TransactionID); err != nil {
 			return err
 		} else if ok {
+			if p.events != nil {
+				p.events.Invalidate()
+			}
+			p.notify(ctx, log, tx.TransactionID)
 			return p.deliver(ctx, log, res, trace)
 		}
 	}
@@ -96,11 +118,17 @@ func (p *Processor) Handle(ctx context.Context, rec consumer.Record) error {
 	// Level 2, Postgres: the primary key is the source of truth.
 	// pending: the transaction is stored, no result yet. A crash from here on leaves it pending;
 	// the replay of this record completes it.
-	if _, err := p.store.InsertTransaction(ctx, storage.Transaction{
+	inserted, err := p.store.InsertTransaction(ctx, storage.Transaction{
 		ID: tx.TransactionID, TerminalID: tx.TerminalID, AmountMinor: tx.AmountMinor,
 		Currency: tx.Currency, Seq: tx.Seq, CreatedAt: tx.CreatedAt,
-	}); err != nil {
+	})
+	if err != nil {
 		return err
+	}
+	if inserted {
+		p.notify(ctx, log, tx.TransactionID)
+	} else if p.events != nil {
+		p.events.Invalidate()
 	}
 	res, ok, err := p.store.GetResult(ctx, tx.TransactionID)
 	if err != nil {
@@ -119,6 +147,7 @@ func (p *Processor) Handle(ctx context.Context, rec consumer.Record) error {
 			return fmt.Errorf("result of %s vanished after save", tx.TransactionID)
 		}
 	}
+	p.notify(ctx, log, tx.TransactionID)
 	return p.deliver(ctx, log, res, trace)
 }
 

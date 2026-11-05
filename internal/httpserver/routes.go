@@ -8,10 +8,14 @@ import (
 // routes is the single place where URL patterns are bound to handlers.
 // Patterns use the Go 1.22+ "METHOD /path" syntax of net/http.ServeMux.
 // Everything except /healthz requires the bearer token.
-func routes(token string, store Store, log *slog.Logger) http.Handler {
+func routes(token string, store Store, log *slog.Logger, options ...Option) http.Handler {
 	a := &api{store: store, log: log}
+	for _, option := range options {
+		option(a)
+	}
 
 	protected := http.NewServeMux()
+	protected.HandleFunc("GET /v1/transactions/stream", a.streamTransactions)
 	protected.HandleFunc("GET /v1/transactions", a.listTransactions)
 	protected.HandleFunc("GET /v1/transactions/{transaction_id}", a.getTransaction)
 	protected.HandleFunc("GET /v1/terminals", a.listTerminals)

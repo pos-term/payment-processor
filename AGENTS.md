@@ -4,7 +4,7 @@ Guidance for AI coding agents working in `payment-processor`. The behaviour of t
 
 ## What this is
 
-A Go service (module `github.com/pos-term/payment-processor`, Go 1.26) that consumes payment transactions from Kafka, decides them, stores everything in Postgres, publishes results back to Kafka and serves a read-only REST API. Redis is used only as a fast duplicate filter.
+A Go service (module `github.com/pos-term/payment-processor`, Go 1.26) that consumes payment transactions from Kafka, decides them, stores everything in Postgres, publishes results back to Kafka and serves a read-only REST API. Redis provides a fast duplicate filter and a bounded SSE replay journal; payment correctness still relies on Postgres.
 
 Part of the [pos-term](https://github.com/pos-term) organization: a system for accepting and reliably processing payment transactions with a POS terminal emulator (project description and team: [.github profile](https://github.com/pos-term/.github/blob/main/profile/README.md), in Russian). The target is a working prototype by December 2026. Sibling repos, expected to be checked out next to this one:
 
@@ -44,6 +44,7 @@ Before declaring a change done: `gofmt`, `go vet`, and the full `-race` run abov
 | `internal/processor` | The business flow: `Parse` and validate, dedup, decide, store, deliver. Depends on `Store`, `Deduper`, `Publisher` interfaces so it is testable without infrastructure. |
 | `internal/storage` | pgx pool, queries, embedded golang-migrate migrations. |
 | `internal/httpserver` | `net/http` `ServeMux` (Go 1.22+ `"METHOD /path"` patterns). All routes are bound in `routes.go`. |
+| `internal/events` | Redis Streams journal, replay cursors, retention detection and recovery invalidation for SSE. |
 | `internal/integration` | End-to-end tests against real Kafka, Postgres and Redis (dedup, DLQ, results, status, scale-out). |
 
 ## Invariants (do not break)
@@ -55,7 +56,7 @@ These are the guarantees the README promises. Several of them are only visible b
 3. **No skipping, no auto-commit.** `enable.auto.commit` stays off. A failing record blocks its partition and is retried with exponential backoff (200ms doubling to 5s); that is intended. `BlockRebalanceOnPoll` is on and `AllowRebalance` must be called on every path that leaves the poll loop.
 4. **Postgres is the source of truth, Redis is a hint.** A payment is decided at most once, enforced by the `transactions` primary key and a single row in `transaction_results`. A Redis answer (`FirstSeen`) may only save work; it must never be the reason a payment is lost or processed twice. Redis errors degrade to Postgres-only with a warning, and the service must still start with Redis down.
 5. **Immutability.** A `transactions` row is never updated. A result is written once; a repeated save must not change it, and after saving the code reads the stored result back and publishes *that* (a republish after a crash must be byte-for-byte equivalent).
-6. **`pending` is derived.** There is no `pending` status in the database or in Kafka: it means "transaction row without a result row". Never write it, never publish it.
+6. **`pending` is derived.** There is no `pending` status in the database or in Kafka: it means "transaction row without a result row". Never write it as a stored status or publish it to Kafka; SSE may expose the derived pending snapshot.
 7. **DLQ is only for unfixable input.** `invalid_json`, `unsupported_schema_version` (checked before other fields), `validation_failed`. The original bytes go unchanged. If the DLQ publish fails, the offset is not committed. A business refusal (`failed` / `LIMIT_EXCEEDED`) is a normal result, never a DLQ message.
 8. **Keying.** Input and results are keyed by `terminal_id` (per-terminal ordering, one partition, one instance). DLQ is keyed by `transaction_id` when readable. Do not change keys without checking the [Kafka docs](https://github.com/pos-term/infra/blob/main/docs/kafka/README.md).
 9. **Scale limit.** At most 3 instances are useful: `pos.transactions.v1` has 3 partitions. Do not add process-local state that assumes a single instance.
@@ -122,9 +123,10 @@ Keep this section current: tick items in the same PR that finishes them.
 - [x] REST API 1.1.0 history filters: repeated unique statuses, literal case-insensitive ID prefix, inclusive amount bounds, currency and case-insensitive exact reason
 - [x] Bearer-token auth for `/v1/*` (`/healthz` stays open)
 
+- [x] SSE `GET /v1/transactions/stream`: shared Redis Streams journal, replay via `Last-Event-ID`, resync after retention/loss/outage, terminal/status filters, 15 s keep-alive and graceful disconnect
+
 ### To do
 
-- [ ] `GET /v1/transactions/stream` (SSE) from [infra/api/openapi.yaml](https://github.com/pos-term/infra/blob/main/api/openapi.yaml): events fanned out through Redis, `Last-Event-ID` replay, `resync`, 15 s keep-alive. Until it exists, `/v1/transactions/stream` is answered by the `{transaction_id}` route with `400`
 - [ ] More business rules and `reason` codes (the list is to be extended together with INFRA#1; today only `LIMIT_EXCEEDED`)
 - [ ] Readiness probe (Postgres / Kafka reachability) separate from the liveness `/healthz`
 - [ ] Metrics (processed / failed / DLQ counts, consumer lag, retry count)
