@@ -96,13 +96,13 @@ func TestListTransactions(t *testing.T) {
 		"after the last":   {ListFilter{Limit: 10, After: txID1}, nil},
 		"terminal":         {ListFilter{Limit: 10, TerminalID: "term-001"}, []string{txID2, txID1}},
 		"unknown terminal": {ListFilter{Limit: 10, TerminalID: "nope"}, nil},
-		"pending":          {ListFilter{Limit: 10, Status: StatusPending}, []string{txID3}},
-		"success":          {ListFilter{Limit: 10, Status: StatusSuccess}, []string{txID1}},
-		"failed":           {ListFilter{Limit: 10, Status: StatusFailed}, []string{txID2}},
+		"pending":          {ListFilter{Limit: 10, Statuses: []string{StatusPending}}, []string{txID3}},
+		"success":          {ListFilter{Limit: 10, Statuses: []string{StatusSuccess}}, []string{txID1}},
+		"failed":           {ListFilter{Limit: 10, Statuses: []string{StatusFailed}}, []string{txID2}},
 		"from":             {ListFilter{Limit: 10, From: from}, []string{txID3, txID2}},
 		"to is exclusive":  {ListFilter{Limit: 10, To: to}, []string{txID2, txID1}},
 		"from and to":      {ListFilter{Limit: 10, From: from, To: to}, []string{txID2}},
-		"combined":         {ListFilter{Limit: 10, TerminalID: "term-001", Status: StatusFailed, After: txID3}, []string{txID2}},
+		"combined":         {ListFilter{Limit: 10, TerminalID: "term-001", Statuses: []string{StatusFailed}, After: txID3}, []string{txID2}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			got, err := s.ListTransactions(ctx, tc.filter)
@@ -158,5 +158,73 @@ func TestListTerminals(t *testing.T) {
 	// term-001's latest transaction is txID2, created an hour after the first.
 	if want := time.Date(2026, 9, 19, 11, 0, 0, 0, time.UTC); !ts[1].LastTransactionAt.Equal(want) {
 		t.Errorf("last_transaction_at = %v, want %v", ts[1].LastTransactionAt, want)
+	}
+}
+
+func TestListTransactionsV110Filters(t *testing.T) {
+	s := openStore(t)
+	seed(t, s)
+	bound := func(n int64) *int64 { return &n }
+	for name, tc := range map[string]struct {
+		filter ListFilter
+		want   []string
+	}{
+		"pending or failed":                {ListFilter{Statuses: []string{StatusPending, StatusFailed}}, []string{txID3, txID2}},
+		"pending or success":               {ListFilter{Statuses: []string{StatusSuccess, StatusPending}}, []string{txID3, txID1}},
+		"final statuses":                   {ListFilter{Statuses: []string{StatusSuccess, StatusFailed}}, []string{txID2, txID1}},
+		"all statuses":                     {ListFilter{Statuses: []string{StatusPending, StatusSuccess, StatusFailed}}, []string{txID3, txID2, txID1}},
+		"pending OR respects terminal AND": {ListFilter{Statuses: []string{StatusPending, StatusFailed}, TerminalID: "term-001"}, []string{txID2}},
+		"terminal case sensitive":          {ListFilter{TerminalID: "TERM-001"}, nil},
+		"prefix case insensitive":          {ListFilter{TransactionIDPrefix: "0192F0C4-7A3E"}, []string{txID3, txID2, txID1}},
+		"full id":                          {ListFilter{TransactionIDPrefix: txID2}, []string{txID2}},
+		"prefix percent literal":           {ListFilter{TransactionIDPrefix: "0192%"}, nil},
+		"prefix underscore literal":        {ListFilter{TransactionIDPrefix: "0192_"}, nil},
+		"prefix backslash literal":         {ListFilter{TransactionIDPrefix: `0192\`}, nil},
+		"prefix SQL is data":               {ListFilter{TransactionIDPrefix: "' OR true --"}, nil},
+		"minimum inclusive":                {ListFilter{MinAmountMinor: bound(300)}, []string{txID3, txID2}},
+		"maximum inclusive":                {ListFilter{MaxAmountMinor: bound(300)}, []string{txID3, txID1}},
+		"equal bounds":                     {ListFilter{MinAmountMinor: bound(300), MaxAmountMinor: bound(300)}, []string{txID3}},
+		"zero lower bound":                 {ListFilter{MinAmountMinor: bound(0)}, []string{txID3, txID2, txID1}},
+		"zero upper bound":                 {ListFilter{MaxAmountMinor: bound(0)}, nil},
+		"int64 max bound":                  {ListFilter{MaxAmountMinor: bound(9223372036854775807)}, []string{txID3, txID2, txID1}},
+		"currency":                         {ListFilter{Currency: "EUR"}, []string{txID3}},
+		"unknown currency":                 {ListFilter{Currency: "USD"}, nil},
+		"reason case insensitive":          {ListFilter{Reason: "limit_exceeded"}, []string{txID2}},
+		"reason exact":                     {ListFilter{Reason: "LIMIT"}, nil},
+		"reason wildcards literal":         {ListFilter{Reason: "LIMIT%"}, nil},
+		"reason only failed":               {ListFilter{Statuses: []string{StatusPending, StatusSuccess}, Reason: "LIMIT_EXCEEDED"}, nil},
+		"all filters":                      {ListFilter{TerminalID: "term-001", Statuses: []string{StatusPending, StatusFailed}, TransactionIDPrefix: "0192F0C4", MinAmountMinor: bound(20000000), MaxAmountMinor: bound(20000000), Currency: "RUB", Reason: "LiMiT_ExCeEdEd", From: time.Date(2026, 9, 19, 11, 0, 0, 0, time.UTC), To: time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC), After: txID3}, []string{txID2}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tc.filter.Limit = 10
+			got, err := s.ListTransactions(context.Background(), tc.filter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !equal(ids(got), tc.want) {
+				t.Fatalf("ids = %v, want %v", ids(got), tc.want)
+			}
+		})
+	}
+}
+
+func TestListTransactionsFilteredPages(t *testing.T) {
+	s := openStore(t)
+	seed(t, s)
+	filter := ListFilter{Limit: 1, Statuses: []string{StatusPending, StatusSuccess}, TransactionIDPrefix: "0192F0C4"}
+	var seen []string
+	for range 4 {
+		page, err := s.ListTransactions(context.Background(), filter)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		seen = append(seen, page[0].ID)
+		filter.After = page[0].ID
+	}
+	if !equal(seen, []string{txID3, txID1}) {
+		t.Fatalf("filtered pages = %v", seen)
 	}
 }
