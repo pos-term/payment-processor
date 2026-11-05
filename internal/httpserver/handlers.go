@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pos-term/payment-processor/internal/storage"
 )
@@ -30,6 +31,8 @@ const (
 // Patterns copied from the schemas in the infra repo.
 var (
 	transactionIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	currencyRe      = regexp.MustCompile(`^[A-Z]{3}$`)
+	amountRe        = regexp.MustCompile(`^[0-9]+$`)
 	terminalIDRe    = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 )
 
@@ -138,11 +141,59 @@ func parseListFilter(r *http.Request) (f storage.ListFilter, detail string) {
 		}
 		f.TerminalID = v
 	}
-	switch v := q.Get("status"); v {
-	case "", storage.StatusPending, storage.StatusSuccess, storage.StatusFailed:
-		f.Status = v
-	default:
-		return f, "status must be one of pending, success, failed"
+	seen := make(map[string]bool)
+	for _, v := range q["status"] {
+		switch v {
+		case storage.StatusPending, storage.StatusSuccess, storage.StatusFailed:
+		default:
+			return f, "status must be one of pending, success, failed"
+		}
+		if seen[v] {
+			return f, "status values must be unique"
+		}
+		seen[v] = true
+		f.Statuses = append(f.Statuses, v)
+	}
+	for _, field := range []struct {
+		name string
+		dst  *string
+	}{
+		{"transaction_id_prefix", &f.TransactionIDPrefix},
+		{"reason", &f.Reason},
+	} {
+		if q.Has(field.name) {
+			v := q.Get(field.name)
+			if n := utf8.RuneCountInString(v); n < 1 || n > 64 {
+				return f, field.name + " must contain 1 to 64 characters"
+			}
+			*field.dst = v
+		}
+	}
+	for _, field := range []struct {
+		name string
+		dst  **int64
+	}{
+		{"min_amount_minor", &f.MinAmountMinor},
+		{"max_amount_minor", &f.MaxAmountMinor},
+	} {
+		if q.Has(field.name) {
+			v := q.Get(field.name)
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || !amountRe.MatchString(v) {
+				return f, field.name + " must be a non-negative int64"
+			}
+			*field.dst = &n
+		}
+	}
+	if f.MinAmountMinor != nil && f.MaxAmountMinor != nil && *f.MaxAmountMinor < *f.MinAmountMinor {
+		return f, "max_amount_minor must not be less than min_amount_minor"
+	}
+	if q.Has("currency") {
+		v := q.Get("currency")
+		if !currencyRe.MatchString(v) {
+			return f, "currency must match " + currencyRe.String()
+		}
+		f.Currency = v
 	}
 	for name, dst := range map[string]*time.Time{"from": &f.From, "to": &f.To} {
 		if v := q.Get(name); v != "" {

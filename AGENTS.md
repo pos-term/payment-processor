@@ -119,6 +119,7 @@ Keep this section current: tick items in the same PR that finishes them.
 - [x] Scale-out to 3 instances verified by integration test
 - [x] Integration tests: dedup, DLQ, results, status, scale
 - [x] REST API: `GET /v1/transactions/{transaction_id}`, `GET /v1/transactions` (filters, cursor pagination), `GET /v1/terminals`, problem+json errors
+- [x] REST API 1.1.0 history filters: repeated unique statuses, literal case-insensitive ID prefix, inclusive amount bounds, currency and case-insensitive exact reason
 - [x] Bearer-token auth for `/v1/*` (`/healthz` stays open)
 
 ### To do

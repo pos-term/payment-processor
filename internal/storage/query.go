@@ -30,12 +30,17 @@ type TransactionView struct {
 	ProcessedAt *time.Time // nil while pending
 }
 
-// ListFilter selects a page of history. Zero fields mean "no filter".
+// ListFilter selects a page of history. Zero fields mean "no filter"; amount bounds use pointers so zero is a bound.
 type ListFilter struct {
-	TerminalID string
-	Status     string
-	From       time.Time // created_at >= From
-	To         time.Time // created_at < To
+	TerminalID          string
+	Statuses            []string
+	TransactionIDPrefix string
+	MinAmountMinor      *int64
+	MaxAmountMinor      *int64
+	Currency            string
+	Reason              string
+	From                time.Time // created_at >= From
+	To                  time.Time // created_at < To
 	// After is the transaction_id of the last item of the previous page.
 	After string
 	Limit int
@@ -92,12 +97,41 @@ func (s *Store) ListTransactions(ctx context.Context, f ListFilter) ([]Transacti
 	if f.TerminalID != "" {
 		add("t.terminal_id = ?", f.TerminalID)
 	}
-	switch f.Status {
-	case "":
-	case StatusPending:
-		where = append(where, "r.transaction_id IS NULL")
-	default:
-		add("r.status = ?", f.Status)
+	if len(f.Statuses) > 0 {
+		var final []string
+		pending := false
+		for _, status := range f.Statuses {
+			if status == StatusPending {
+				pending = true
+			} else {
+				final = append(final, status)
+			}
+		}
+		switch {
+		case pending && len(final) > 0:
+			add("(r.transaction_id IS NULL OR r.status = ANY(?))", final)
+		case pending:
+			where = append(where, "r.transaction_id IS NULL")
+		default:
+			add("r.status = ANY(?)", final)
+		}
+	}
+	if f.TransactionIDPrefix != "" {
+		// Escape LIKE metacharacters so a prefix is always literal.
+		prefix := strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(f.TransactionIDPrefix)
+		add("t.transaction_id::text ILIKE ?", prefix+"%")
+	}
+	if f.MinAmountMinor != nil {
+		add("t.amount_minor >= ?", *f.MinAmountMinor)
+	}
+	if f.MaxAmountMinor != nil {
+		add("t.amount_minor <= ?", *f.MaxAmountMinor)
+	}
+	if f.Currency != "" {
+		add("t.currency = ?", f.Currency)
+	}
+	if f.Reason != "" {
+		add("lower(r.reason) = lower(?)", f.Reason)
 	}
 	if !f.From.IsZero() {
 		add("t.created_at >= ?", f.From)

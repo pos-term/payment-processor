@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -255,7 +256,7 @@ func TestListTransactionsFilters(t *testing.T) {
 	store := &fakeStore{}
 	authed(t, store, "/v1/transactions?terminal_id=term-007&status=pending&from=2026-09-19T10:00:00Z&to=2026-09-19T12:00:00%2B02:00&limit=10")
 	f := store.gotFilter
-	if f.TerminalID != "term-007" || f.Status != "pending" || f.Limit != 11 {
+	if f.TerminalID != "term-007" || !slices.Equal(f.Statuses, []string{"pending"}) || f.Limit != 11 {
 		t.Errorf("filter = %+v", f)
 	}
 	if !f.From.Equal(time.Date(2026, 9, 19, 10, 0, 0, 0, time.UTC)) || !f.To.Equal(time.Date(2026, 9, 19, 10, 0, 0, 0, time.UTC)) {
@@ -295,5 +296,59 @@ func TestCursorRoundTrip(t *testing.T) {
 	id, ok := decodeCursor(encodeCursor(txID1))
 	if !ok || id != txID1 {
 		t.Errorf("decodeCursor(encodeCursor(id)) = %q, %v", id, ok)
+	}
+}
+
+func TestListTransactionsV110FiltersReachStorage(t *testing.T) {
+	store := &fakeStore{}
+	rec := authed(t, store, "/v1/transactions?status=failed&status=pending&transaction_id_prefix=0192F0C4&min_amount_minor=0&max_amount_minor=9223372036854775807&currency=RUB&reason=limit_exceeded&limit=20&cursor="+encodeCursor(txID3))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	f := store.gotFilter
+	if !slices.Equal(f.Statuses, []string{"failed", "pending"}) || f.TransactionIDPrefix != "0192F0C4" ||
+		f.MinAmountMinor == nil || *f.MinAmountMinor != 0 || f.MaxAmountMinor == nil || *f.MaxAmountMinor != 9223372036854775807 ||
+		f.Currency != "RUB" || f.Reason != "limit_exceeded" || f.Limit != 21 || f.After != txID3 {
+		t.Fatalf("filter = %+v", f)
+	}
+}
+
+func TestListTransactionsV110RejectsBadParameters(t *testing.T) {
+	for _, q := range []string{
+		"status=", "status=failed&status=failed", "status=pending&status=", "status=success&status=done", "status=pending,failed",
+		"transaction_id_prefix=", "transaction_id_prefix=" + strings.Repeat("a", 65),
+		"reason=", "reason=" + strings.Repeat("a", 65),
+		"min_amount_minor=", "min_amount_minor=-1", "min_amount_minor=1.5", "min_amount_minor=abc",
+		"max_amount_minor=", "max_amount_minor=-1", "max_amount_minor=1e3", "max_amount_minor=9223372036854775808",
+		"min_amount_minor=9223372036854775808", "min_amount_minor=100&max_amount_minor=99",
+		"currency=", "currency=rub", "currency=EU", "currency=RUBB", "currency=123",
+	} {
+		t.Run(q, func(t *testing.T) {
+			store := &fakeStore{}
+			wantProblem(t, authed(t, store, "/v1/transactions?"+q), http.StatusBadRequest, "invalid_parameter")
+			if store.gotFilter.Limit != 0 {
+				t.Fatal("invalid request reached storage")
+			}
+		})
+	}
+}
+
+func TestParseListFilterV110Boundaries(t *testing.T) {
+	for _, q := range []string{
+		"", "status=pending&status=success&status=failed",
+		"min_amount_minor=0&max_amount_minor=0", "min_amount_minor=100&max_amount_minor=100",
+		"transaction_id_prefix=" + strings.Repeat("a", 64), "reason=" + strings.Repeat("a", 64),
+		"transaction_id_prefix=" + strings.Repeat("я", 64), "reason=" + strings.Repeat("я", 64),
+	} {
+		t.Run(q, func(t *testing.T) {
+			_, detail := parseListFilter(httptest.NewRequest(http.MethodGet, "/v1/transactions?"+q, nil))
+			if detail != "" {
+				t.Fatal(detail)
+			}
+		})
+	}
+	f, detail := parseListFilter(httptest.NewRequest(http.MethodGet, "/v1/transactions?unknown=value", nil))
+	if detail != "" || f.MinAmountMinor != nil || f.MaxAmountMinor != nil || len(f.Statuses) != 0 {
+		t.Fatalf("default filter = %+v, detail = %q", f, detail)
 	}
 }

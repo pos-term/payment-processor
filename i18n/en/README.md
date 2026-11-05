@@ -144,20 +144,21 @@ The `payment-processor` service in `infra/docker-compose.yml` runs as a single i
 
 ## REST API
 
-Read-only, for the cashier app. Data comes from Postgres, so every instance answers the same. Contract: [openapi.yaml](https://github.com/pos-term/infra/blob/main/api/openapi.yaml).
+Read-only, for the cashier app. Data comes from Postgres, so every instance answers the same. Contract **1.1.0**: [openapi.yaml](https://github.com/pos-term/infra/blob/main/api/openapi.yaml).
 
 | Method and path | Returns |
 |---|---|
 | `GET /healthz` | liveness, no token needed |
 | `GET /v1/transactions/{transaction_id}` | status of one transaction; `pending` until a result exists |
-| `GET /v1/transactions` | history, newest first. Filters `terminal_id`, `status`, `from`, `to`, paging with `limit` (1–200, default 50) and `cursor` |
+| `GET /v1/transactions` | history, newest first. Filters `terminal_id`, `status`, `transaction_id_prefix`, `min_amount_minor`, `max_amount_minor`, `currency`, `reason`, `from`, `to`; paging with `limit` (1–200, default 50) and `cursor` |
 | `GET /v1/terminals` | terminals that have sent at least one transaction |
 
 `GET /v1/transactions/stream` (SSE) is not implemented yet.
 
 - **Token.** Every `/v1/*` path requires `Authorization: Bearer <API_TOKEN>`. A missing or wrong token gives `401` with `WWW-Authenticate: Bearer`, and parameters are not validated first.
 - **Errors.** `application/problem+json` (RFC 9457) with a `code` field: `invalid_parameter` (400), `unauthorized` (401), `not_found` (404), `internal_error` (500). Details of an internal error go to the log only, never to the client.
-- **Pagination.** Ordered by `transaction_id` descending (UUIDv7, i.e. creation order). `next_cursor` is opaque: the client passes it back as `cursor` to get the next page, and it is `null` on the last page. Pages do not shift when new transactions arrive, because the cursor points at a concrete id.
+- **1.1.0 filters.** Repeat `status` for multiple values: `status=failed&status=pending`. Values must be unique members of `pending`, `success`, `failed`; empty statuses are invalid. `transaction_id_prefix` is a literal, case-insensitive prefix (1–64 characters); `%`, `_` and `\` are not wildcards. `reason` matches exactly, ignoring case (1–64 characters). `terminal_id` is case-sensitive; `currency` must be exactly three uppercase ASCII letters. `min_amount_minor` and `max_amount_minor` are inclusive non-negative int64 bounds in minor units; a maximum below the minimum returns `400 invalid_parameter`. Empty new parameters and invalid values also return `400`. Different filters are combined with AND; statuses within `status` are combined with OR. Unknown query parameters are ignored.
+- **Pagination.** Filters apply before the page limit; clients repeat the same filters when following a cursor. Ordered by `transaction_id` descending (UUIDv7, i.e. creation order). `next_cursor` is opaque: the client passes it back as `cursor` to get the next page, and it is `null` on the last page. Pages do not shift when new transactions arrive, because the cursor points at a concrete id.
 - **Time.** UTC with milliseconds. `from` is inclusive, `to` is exclusive, both on `created_at` (terminal time).
 
 ## Tests
