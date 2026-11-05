@@ -37,8 +37,10 @@ var (
 )
 
 type api struct {
-	store Store
-	log   *slog.Logger
+	events    EventSource
+	keepAlive time.Duration
+	store     Store
+	log       *slog.Logger
 }
 
 // healthz reports liveness only: the process is up and serving. It needs no token.

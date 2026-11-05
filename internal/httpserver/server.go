@@ -5,15 +5,16 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 )
 
 // New builds the HTTP server around the route table. The API requires the bearer token.
-func New(addr, token string, store Store, log *slog.Logger) *http.Server {
+func New(addr, token string, store Store, log *slog.Logger, options ...Option) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           routes(token, store, log),
+		Handler:           routes(token, store, log, options...),
 		ReadHeaderTimeout: 5 * time.Second,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelError),
 	}
@@ -21,6 +22,7 @@ func New(addr, token string, store Store, log *slog.Logger) *http.Server {
 
 // Run serves until ctx is cancelled, then shuts down gracefully within timeout.
 func Run(ctx context.Context, srv *http.Server, timeout time.Duration, log *slog.Logger) error {
+	srv.BaseContext = func(net.Listener) context.Context { return ctx }
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info("http server listening", "addr", srv.Addr)
@@ -39,5 +41,9 @@ func Run(ctx context.Context, srv *http.Server, timeout time.Duration, log *slog
 	log.Info("shutting down", "timeout", timeout)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		_ = srv.Close()
+		return err
+	}
+	return nil
 }

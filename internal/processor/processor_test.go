@@ -465,3 +465,45 @@ func TestHandleReturnsNilOnlyAfterPublishAndMark(t *testing.T) {
 		t.Error("a result that was not published must not be recorded as published")
 	}
 }
+
+type eventObserver struct {
+	store         *memStore
+	statuses      []string
+	invalidations int
+	err           error
+}
+
+func (e *eventObserver) Invalidate() { e.invalidations++ }
+func (e *eventObserver) TransactionUpdated(_ context.Context, id string) error {
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
+	if _, ok := e.store.txs[id]; !ok {
+		return errors.New("not stored yet")
+	}
+	status := "pending"
+	if result, ok := e.store.results[id]; ok {
+		status = result.Status
+	}
+	e.statuses = append(e.statuses, status)
+	return e.err
+}
+
+func TestSSENotificationsFollowStoredStatusWithoutBlockingDelivery(t *testing.T) {
+	for _, failure := range []error{nil, errBoom} {
+		store, pub := newMemStore(), &memDLQ{}
+		observer := &eventObserver{store: store, err: failure}
+		p := newProc(store, pub, 0).WithEvents(observer)
+		if err := p.Handle(context.Background(), rec(validTx)); err != nil {
+			t.Fatal(err)
+		}
+		if len(observer.statuses) != 2 || observer.statuses[0] != "pending" || observer.statuses[1] != "success" || len(pub.results) != 1 || !store.results[txID].Published {
+			t.Fatalf("statuses=%v, results=%v", observer.statuses, pub.results)
+		}
+		if err := p.Handle(context.Background(), rec(validTx)); err != nil {
+			t.Fatal(err)
+		}
+		if observer.invalidations != 1 || store.saves != 1 || len(pub.results) != 1 {
+			t.Fatal("replay changed the decision or delivery")
+		}
+	}
+}

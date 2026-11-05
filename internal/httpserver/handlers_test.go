@@ -190,7 +190,7 @@ func TestGetTransaction(t *testing.T) {
 	})
 
 	t.Run("not a UUIDv7", func(t *testing.T) {
-		for _, id := range []string{"abc", "stream", "0192f0c4-7a3e-4b21-9d4e-2c1f8a6b5e10"} {
+		for _, id := range []string{"abc", "0192f0c4-7a3e-4b21-9d4e-2c1f8a6b5e10"} {
 			wantProblem(t, authed(t, store, "/v1/transactions/"+id), http.StatusBadRequest, "invalid_parameter")
 		}
 	})

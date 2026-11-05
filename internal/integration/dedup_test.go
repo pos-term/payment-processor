@@ -123,7 +123,7 @@ type instance struct {
 func (i *instance) stop() { i.cancel(); <-i.done; i.cons.Close() }
 
 // start runs a processor on top of st and stops it when the test ends.
-func (e *dedupEnv) start(t *testing.T, st processor.Store) *instance {
+func (e *dedupEnv) start(t *testing.T, st processor.Store, sinks ...processor.Events) *instance {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cons, err := consumer.New(e.cfg, log)
@@ -131,6 +131,9 @@ func (e *dedupEnv) start(t *testing.T, st processor.Store) *instance {
 		t.Fatal(err)
 	}
 	proc := processor.New(st, processor.NewRedisDeduper(e.redis, time.Hour), cons, 0, log)
+	if len(sinks) > 0 {
+		proc.WithEvents(sinks[0])
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	i := &instance{cancel: cancel, done: make(chan struct{}), cons: cons}
 	go func() { defer close(i.done); _ = cons.Run(ctx, proc) }()
