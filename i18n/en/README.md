@@ -188,6 +188,8 @@ TEST_KAFKA_BROKERS=localhost:9094 TEST_POSTGRES_DSN='postgres://pos:pos@localhos
 
 The consumer tests create their own topic and group.
 
+[GitHub Actions](../../.github/workflows/ci.yml) checks formatting, build and `go vet`, then runs the full test suite with `-race` against separate Kafka, Postgres and Redis containers. Checks run for pull requests into `main` and pushes to `main`. A skipped test fails the run.
+
 ## Contracts
 
 - [REST API](https://github.com/pos-term/infra/blob/main/api/i18n/en/README.md): OpenAPI specification [openapi.yaml](https://github.com/pos-term/infra/blob/main/api/openapi.yaml)

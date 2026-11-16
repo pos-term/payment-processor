@@ -188,6 +188,8 @@ TEST_KAFKA_BROKERS=localhost:9094 TEST_POSTGRES_DSN='postgres://pos:pos@localhos
 
 Тесты consumer создают свой топик и группу.
 
+[GitHub Actions](.github/workflows/ci.yml) проверяет форматирование, сборку и `go vet`, затем прогоняет все тесты с `-race` на отдельных контейнерах Kafka, Postgres и Redis. Проверки запускаются на PR в `main` и при пуше в `main`. Пропущенный тест делает прогон неуспешным.
+
 ## Контракты
 
 - [REST API](https://github.com/pos-term/infra/blob/main/api/README.md): OpenAPI-спецификация [openapi.yaml](https://github.com/pos-term/infra/blob/main/api/openapi.yaml)
