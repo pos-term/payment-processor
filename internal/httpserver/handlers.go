@@ -39,6 +39,7 @@ var (
 type api struct {
 	events    EventSource
 	keepAlive time.Duration
+	readiness readinessChecks
 	store     Store
 	log       *slog.Logger
 }

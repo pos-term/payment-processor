@@ -51,6 +51,9 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 // Close releases all connections.
 func (s *Store) Close() { s.pool.Close() }
 
+// Ping checks reachability through the pool used for payment processing.
+func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
+
 // InsertTransaction stores the payment as pending (a transaction without a result).
 // It reports false when the transaction_id is already known: the primary key is the final dedup.
 func (s *Store) InsertTransaction(ctx context.Context, tx Transaction) (bool, error) {

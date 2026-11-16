@@ -7,7 +7,7 @@ import (
 
 // routes is the single place where URL patterns are bound to handlers.
 // Patterns use the Go 1.22+ "METHOD /path" syntax of net/http.ServeMux.
-// Everything except /healthz requires the bearer token.
+// The /v1/ routes require the bearer token. Probes are public.
 func routes(token string, store Store, log *slog.Logger, options ...Option) http.Handler {
 	a := &api{store: store, log: log}
 	for _, option := range options {
@@ -22,6 +22,7 @@ func routes(token string, store Store, log *slog.Logger, options ...Option) http
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
+	mux.HandleFunc("GET /readyz", a.readyz)
 	mux.Handle("/v1/", bearerAuth(token, protected))
 	return mux
 }

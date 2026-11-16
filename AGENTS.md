@@ -121,14 +121,14 @@ Keep this section current: tick items in the same PR that finishes them.
 - [x] Integration tests: dedup, DLQ, results, status, scale
 - [x] REST API: `GET /v1/transactions/{transaction_id}`, `GET /v1/transactions` (filters, cursor pagination), `GET /v1/terminals`, problem+json errors
 - [x] REST API 1.1.0 history filters: repeated unique statuses, literal case-insensitive ID prefix, inclusive amount bounds, currency and case-insensitive exact reason
-- [x] Bearer-token auth for `/v1/*` (`/healthz` stays open)
+- [x] Bearer-token auth for `/v1/*` (`/healthz` and `/readyz` stay open)
+- [x] Readiness probe `GET /readyz` (Postgres and Kafka reachability) separate from the liveness `/healthz`
 
 - [x] SSE `GET /v1/transactions/stream`: shared Redis Streams journal, replay via `Last-Event-ID`, resync after retention/loss/outage, terminal/status filters, 15 s keep-alive and graceful disconnect
 
 ### To do
 
 - [ ] More business rules and `reason` codes (the list is to be extended together with INFRA#1; today only `LIMIT_EXCEEDED`)
-- [ ] Readiness probe (Postgres / Kafka reachability) separate from the liveness `/healthz`
 - [ ] Metrics (processed / failed / DLQ counts, consumer lag, retry count)
 - [ ] Load testing of the transaction processing pipeline (a project goal from the [.github profile](https://github.com/pos-term/.github/blob/main/profile/README.md)): define the target load (terminals, TPS), build a generator that publishes to `pos.transactions.v1`, measure throughput, end-to-end latency (input to result in `pos.transaction-results.v1`), consumer lag and behaviour with 1 to 3 instances, and record the results in the docs. Today only correctness under scale-out is tested, not performance
 - [ ] CI: build, vet, gofmt, and tests with services (no workflow files in the repo yet)
