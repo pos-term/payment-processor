@@ -69,13 +69,17 @@ func run() error {
 
 	journal := events.New(rdb, store, "")
 	proc := processor.New(store, processor.NewRedisDeduper(rdb, cfg.DedupTTL), cons, cfg.MaxAmountMinor, log).WithEvents(journal)
+	server := httpserver.New(cfg.HTTPAddr, cfg.APIToken, store, log,
+		httpserver.WithEventSource(journal),
+		httpserver.WithReadinessChecks(store.Ping, cons.Ping),
+	)
 
 	// Either part failing stops the other one.
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return journal.Run(gctx) })
 	g.Go(func() error { return cons.Run(gctx, proc) })
 	g.Go(func() error {
-		return httpserver.Run(gctx, httpserver.New(cfg.HTTPAddr, cfg.APIToken, store, log, httpserver.WithEventSource(journal)), cfg.ShutdownTimeout, log)
+		return httpserver.Run(gctx, server, cfg.ShutdownTimeout, log)
 	})
 	return g.Wait()
 }

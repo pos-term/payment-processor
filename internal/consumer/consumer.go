@@ -9,7 +9,9 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 // Default names from infra/docs/kafka.
@@ -118,6 +120,34 @@ func New(cfg Config, log *slog.Logger) (*Consumer, error) {
 
 // Close leaves the group and releases connections.
 func (c *Consumer) Close() { c.client.Close() }
+
+// Ping checks whether the payment client can communicate with a Kafka broker.
+func (c *Consumer) Ping(ctx context.Context) error {
+	req := kmsg.NewPtrMetadataRequest()
+	req.Topics = []kmsg.MetadataRequestTopic{} // Request broker metadata only.
+	brokers := append(c.client.DiscoveredBrokers(), c.client.SeedBrokers()...)
+	if len(brokers) == 0 {
+		return fmt.Errorf("no Kafka brokers available")
+	}
+
+	// Broker.Request returns on context cancellation even if a queued response
+	// is still blocked. Client.Ping waits for that response.
+	var lastErr error
+	for _, broker := range brokers {
+		resp, err := req.RequestWith(ctx, broker)
+		if err == nil {
+			err = kerr.ErrorForCode(resp.ErrorCode)
+		}
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		lastErr = err
+	}
+	return lastErr
+}
 
 // Run consumes until ctx is cancelled. Offsets are committed only for records the handler finished.
 func (c *Consumer) Run(ctx context.Context, h Handler) error {
