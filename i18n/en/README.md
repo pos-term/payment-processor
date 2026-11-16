@@ -163,7 +163,7 @@ Read-only, for the cashier app. Data comes from Postgres, so every instance answ
 
 ## Event stream (SSE)
 
-`GET /v1/transactions/stream` requires the same Bearer token. A `transaction.updated` event contains a transaction in the REST JSON format: first `pending`, then `success` or `failed`. Optional `terminal_id` matches exactly; `status` accepts one value (`pending`, `success`, `failed`) and cannot be repeated for SSE. A `: keep-alive` comment is sent every 15 seconds. Slow connections close after the 5-second write deadline.
+`GET /v1/transactions/stream` requires the same Bearer token. A `transaction.updated` event contains a transaction in the REST JSON format: first `pending`, then `success` or `failed`. Optional `terminal_id` matches exactly; `status` accepts one value (`pending`, `success`, `failed`) and cannot be repeated for SSE. A `: keep-alive` comment is sent every 15 seconds. Each frame has a 5-second write deadline. The server closes the stream if the write times out.
 
 All instances share Redis Stream `pos:transaction-events:v1`, retaining approximately the last 10,000 events. Each subscriber reads its own position, so all subscribers receive events. Servers poll every 250 ms. Reconnect using the saved event `id` in `Last-Event-ID`, including when switching instances. IDs are opaque and include the journal generation and ordered Redis ID. Without `Last-Event-ID`, streaming starts at the current journal tail. On initial load, clients open the stream and buffer events before fetching history, then apply the buffered updates.
 
