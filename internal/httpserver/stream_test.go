@@ -136,6 +136,41 @@ func TestSSEExpiredCursorAndKeepAlive(t *testing.T) {
 	}
 }
 
+func TestSSEHTTP2HeartbeatAfterIdle(t *testing.T) {
+	t.Parallel()
+
+	// The first heartbeat must come after the five-second write deadline.
+	source := &scriptedSource{}
+	server := httptest.NewUnstartedServer(New(":0", testToken, &fakeStore{}, discardLogger(),
+		WithEventSource(source), func(a *api) { a.keepAlive = 6 * time.Second }).Handler)
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/v1/transactions/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	response, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.ProtoMajor != 2 {
+		t.Fatalf("got status %d over %s, want 200 over HTTP/2", response.StatusCode, response.Proto)
+	}
+	reader := bufio.NewReader(response.Body)
+	if got := frame(t, reader); got != ": connected\n\n" {
+		t.Fatalf("initial frame = %q", got)
+	}
+	if got := frame(t, reader); got != ": keep-alive\n\n" {
+		t.Fatalf("heartbeat frame = %q", got)
+	}
+}
+
 func TestSSEOutageAndRecoveryResync(t *testing.T) {
 	source := &scriptedSource{err: errors.New("redis down")}
 	reader, _ := openStream(t, source, "/v1/transactions/stream", "")

@@ -47,7 +47,12 @@ func (a *api) streamTransactions(w http.ResponseWriter, r *http.Request) {
 		if _, err := fmt.Fprint(w, frame); err != nil {
 			return false
 		}
-		return rc.Flush() == nil
+		if err := rc.Flush(); err != nil {
+			return false
+		}
+		// Scope the deadline to this frame so idle HTTP/2 streams stay open.
+		_ = rc.SetWriteDeadline(time.Time{})
+		return true
 	}
 	sendReset := func(id string) bool {
 		frame := "event: resync\ndata: {}\n\n"
