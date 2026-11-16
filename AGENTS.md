@@ -124,13 +124,14 @@ Keep this section current: tick items in the same PR that finishes them.
 - [x] Bearer-token auth for `/v1/*` (`/healthz` and `/readyz` stay open)
 - [x] Readiness probe `GET /readyz` (Postgres and Kafka reachability) separate from the liveness `/healthz`
 - [x] GitHub Actions CI: gofmt, build, vet, and race tests with Kafka, Postgres and Redis
+- [x] Prometheus `GET /metrics`: published results by status, published dead letters and processing retries
 
 - [x] SSE `GET /v1/transactions/stream`: shared Redis Streams journal, replay via `Last-Event-ID`, resync after retention/loss/outage, terminal/status filters, 15 s keep-alive and graceful disconnect
 
 ### To do
 
 - [ ] More business rules and `reason` codes (the list is to be extended together with INFRA#1; today only `LIMIT_EXCEEDED`)
-- [ ] Metrics (processed / failed / DLQ counts, consumer lag, retry count)
+- [ ] Consumer lag measurement
 - [ ] Load testing of the transaction processing pipeline (a project goal from the [.github profile](https://github.com/pos-term/.github/blob/main/profile/README.md)): define the target load (terminals, TPS), build a generator that publishes to `pos.transactions.v1`, measure throughput, end-to-end latency (input to result in `pos.transaction-results.v1`), consumer lag and behaviour with 1 to 3 instances, and record the results in the docs. Today only correctness under scale-out is tested, not performance
 - [ ] Publish the Docker image to a registry so [infra](https://github.com/pos-term/infra) no longer builds from the sibling directory
 - [ ] Optional: a DLQ replay tool or documented manual procedure

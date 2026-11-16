@@ -178,6 +178,10 @@ curl -N -H 'Authorization: Bearer dev-token' \
   'http://localhost:8080/v1/transactions/stream?terminal_id=term-001'
 ```
 
+## Metrics
+
+`GET /metrics` on the processor's HTTP port exposes Prometheus counters. Use the same Bearer token as for the REST API. The counters cover results and dead letters acknowledged by Kafka and repeated processing attempts. A republished result increments its counter again. [Metrics contract](https://github.com/pos-term/infra/blob/main/docs/monitoring/i18n/en/README.md).
+
 ## Tests
 
 ```bash

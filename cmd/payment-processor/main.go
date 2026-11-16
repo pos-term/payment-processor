@@ -17,6 +17,7 @@ import (
 	"github.com/pos-term/payment-processor/internal/consumer"
 	"github.com/pos-term/payment-processor/internal/events"
 	"github.com/pos-term/payment-processor/internal/httpserver"
+	"github.com/pos-term/payment-processor/internal/metrics"
 	"github.com/pos-term/payment-processor/internal/processor"
 	"github.com/pos-term/payment-processor/internal/storage"
 )
@@ -67,11 +68,14 @@ func run() error {
 	}
 	defer cons.Close()
 
+	counters := metrics.New()
+	cons.WithMetrics(counters)
 	journal := events.New(rdb, store, "")
 	proc := processor.New(store, processor.NewRedisDeduper(rdb, cfg.DedupTTL), cons, cfg.MaxAmountMinor, log).WithEvents(journal)
 	server := httpserver.New(cfg.HTTPAddr, cfg.APIToken, store, log,
 		httpserver.WithEventSource(journal),
 		httpserver.WithReadinessChecks(store.Ping, cons.Ping),
+		httpserver.WithMetrics(counters.Handler()),
 	)
 
 	// Either part failing stops the other one.
