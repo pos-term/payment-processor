@@ -80,11 +80,19 @@ type HandlerFunc func(ctx context.Context, rec Record) error
 // Handle implements Handler.
 func (f HandlerFunc) Handle(ctx context.Context, rec Record) error { return f(ctx, rec) }
 
+// Metrics observes acknowledgements and repeated attempts in the consumer.
+type Metrics interface {
+	ResultPublished(status string)
+	DeadLetterPublished()
+	ProcessingRetried()
+}
+
 // Consumer reads, hands records to the Handler and commits. It also produces results and dead letters.
 type Consumer struct {
-	cfg    Config
-	client *kgo.Client
-	log    *slog.Logger
+	cfg     Config
+	client  *kgo.Client
+	log     *slog.Logger
+	metrics Metrics
 }
 
 // New creates the Kafka client. It does not connect until Run.
@@ -116,6 +124,12 @@ func New(cfg Config, log *slog.Logger) (*Consumer, error) {
 		return nil, fmt.Errorf("create kafka client: %w", err)
 	}
 	return &Consumer{cfg: cfg, client: client, log: log}, nil
+}
+
+// WithMetrics connects the counters before the consumer starts.
+func (c *Consumer) WithMetrics(metrics Metrics) *Consumer {
+	c.metrics = metrics
+	return c
 }
 
 // Close leaves the group and releases connections.
@@ -202,6 +216,9 @@ func (c *Consumer) handle(ctx context.Context, h Handler, r *kgo.Record) error {
 			return ctx.Err()
 		case <-time.After(backoff):
 		}
+		if c.metrics != nil {
+			c.metrics.ProcessingRetried()
+		}
 		backoff = min(backoff*2, maxBackoff)
 	}
 }
@@ -241,7 +258,13 @@ func (c *Consumer) PublishDeadLetter(ctx context.Context, d DeadLetter) error {
 	if d.TransactionID != "" {
 		key = []byte(d.TransactionID)
 	}
-	return c.produce(ctx, &kgo.Record{Topic: c.cfg.DLQTopic, Key: key, Value: d.Record.Value, Headers: headers})
+	if err := c.produce(ctx, &kgo.Record{Topic: c.cfg.DLQTopic, Key: key, Value: d.Record.Value, Headers: headers}); err != nil {
+		return err
+	}
+	if c.metrics != nil {
+		c.metrics.DeadLetterPublished()
+	}
+	return nil
 }
 
 // resultMessage is the pos.transaction-results.v1 value, see infra/schemas.
@@ -268,7 +291,13 @@ func (c *Consumer) PublishResult(ctx context.Context, r Result) error {
 	if r.TraceID != "" {
 		headers = append(headers, kgo.RecordHeader{Key: "trace_id", Value: []byte(r.TraceID)})
 	}
-	return c.produce(ctx, &kgo.Record{Topic: c.cfg.ResultsTopic, Key: []byte(r.TerminalID), Value: value, Headers: headers})
+	if err := c.produce(ctx, &kgo.Record{Topic: c.cfg.ResultsTopic, Key: []byte(r.TerminalID), Value: value, Headers: headers}); err != nil {
+		return err
+	}
+	if c.metrics != nil {
+		c.metrics.ResultPublished(r.Status)
+	}
+	return nil
 }
 
 func (c *Consumer) produce(ctx context.Context, r *kgo.Record) error {

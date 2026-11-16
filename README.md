@@ -178,6 +178,10 @@ curl -N -H 'Authorization: Bearer dev-token' \
   'http://localhost:8080/v1/transactions/stream?terminal_id=term-001'
 ```
 
+## Метрики
+
+Эндпоинт `GET /metrics` на HTTP-порту процессора отдаёт счётчики Prometheus. Передайте тот же Bearer-токен, что и для REST API. Счётчики отражают результаты и сообщения DLQ, подтверждённые Kafka, а также повторные попытки обработки. Повторная публикация считается отдельным событием. [Контракт метрик](https://github.com/pos-term/infra/blob/main/docs/monitoring/README.md).
+
 ## Тесты
 
 ```bash
